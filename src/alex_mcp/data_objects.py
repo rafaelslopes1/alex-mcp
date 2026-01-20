@@ -157,6 +157,14 @@ class OptimizedWorkResult(BaseModel):
     referenced_works: Optional[List[str]] = None  # Work IDs this paper cites
     related_works: Optional[List[str]] = None  # Related work IDs from OpenAlex
 
+    # Truncation flags (LLM-friendly defaults)
+    abstract_truncated: Optional[bool] = None
+    authorships_truncated: Optional[bool] = None
+    locations_truncated: Optional[bool] = None
+    references_truncated: Optional[bool] = None
+    related_works_truncated: Optional[bool] = None
+    fulltext_urls_truncated: Optional[bool] = None
+
 
 class OptimizedSearchResponse(BaseModel):
     """
@@ -541,7 +549,23 @@ def optimize_author_data(author_data: Dict[str, Any]) -> OptimizedAuthorResult:
     )
 
 
-def optimize_work_data(work_data: Dict[str, Any]) -> OptimizedWorkResult:
+def optimize_work_data(
+    work_data: Dict[str, Any],
+    include_authorships: bool = False,
+    include_locations: bool = False,
+    include_best_oa_location: bool = True,
+    include_references: bool = False,
+    include_related_works: bool = False,
+    include_abstract_inverted_index: bool = False,
+    include_fulltext_urls: bool = False,
+    max_authorships: int = 20,
+    max_locations: int = 5,
+    max_references: int = 50,
+    max_related_works: int = 20,
+    max_fulltext_urls: int = 3,
+    abstract_max_chars: int = 2000,
+    compact_ids: bool = False
+) -> OptimizedWorkResult:
     """
     Convert full OpenAlex work object to optimized version.
     
@@ -601,10 +625,70 @@ def optimize_work_data(work_data: Dict[str, Any]) -> OptimizedWorkResult:
     # Extract abstract info (may be overridden by Semantic Scholar later)
     abstract_inverted_index = work_data.get('abstract_inverted_index')
     abstract_text = work_data.get('abstract')
+    fulltext_urls = None
+    abstract_truncated = None
+    if abstract_text and abstract_max_chars and len(abstract_text) > abstract_max_chars:
+        abstract_text = abstract_text[:abstract_max_chars].rstrip() + "..."
+        abstract_truncated = True
     
     # Citation graph info
     referenced_works = work_data.get('referenced_works', [])
     related_works = work_data.get('related_works', [])
+
+    # Apply compact options and truncation
+    authorships_truncated = None
+    locations_truncated = None
+    references_truncated = None
+    related_works_truncated = None
+    fulltext_urls_truncated = None
+
+    if include_authorships and full_authorships:
+        if max_authorships and len(full_authorships) > max_authorships:
+            full_authorships = full_authorships[:max_authorships]
+            authorships_truncated = True
+    else:
+        full_authorships = None
+
+    if include_locations and all_locations:
+        if max_locations and len(all_locations) > max_locations:
+            all_locations = all_locations[:max_locations]
+            locations_truncated = True
+    else:
+        all_locations = None
+
+    if not include_best_oa_location:
+        best_oa_location = None
+
+    if include_references and referenced_works:
+        if max_references and len(referenced_works) > max_references:
+            referenced_works = referenced_works[:max_references]
+            references_truncated = True
+    else:
+        referenced_works = None
+
+    if include_related_works and related_works:
+        if max_related_works and len(related_works) > max_related_works:
+            related_works = related_works[:max_related_works]
+            related_works_truncated = True
+    else:
+        related_works = None
+
+    if not include_abstract_inverted_index:
+        abstract_inverted_index = None
+
+    if not include_fulltext_urls:
+        fulltext_urls_truncated = None
+    else:
+        if isinstance(work_data.get('fulltext_urls'), list):
+            fulltext_urls = work_data.get('fulltext_urls')
+            if max_fulltext_urls and len(fulltext_urls) > max_fulltext_urls:
+                fulltext_urls = fulltext_urls[:max_fulltext_urls]
+                fulltext_urls_truncated = True
+        else:
+            fulltext_urls = None
+
+    if compact_ids and comprehensive_ids and comprehensive_ids.doi:
+        doi = None
     
     return OptimizedWorkResult(
         id=work_id,
@@ -630,5 +714,12 @@ def optimize_work_data(work_data: Dict[str, Any]) -> OptimizedWorkResult:
         locations=all_locations,
         best_oa_location=best_oa_location,
         referenced_works=referenced_works if referenced_works else None,
-        related_works=related_works if related_works else None
+        related_works=related_works if related_works else None,
+        fulltext_urls=fulltext_urls if include_fulltext_urls else None,
+        abstract_truncated=abstract_truncated,
+        authorships_truncated=authorships_truncated,
+        locations_truncated=locations_truncated,
+        references_truncated=references_truncated,
+        related_works_truncated=related_works_truncated,
+        fulltext_urls_truncated=fulltext_urls_truncated
     )

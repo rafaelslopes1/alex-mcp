@@ -62,7 +62,9 @@ def get_config():
     }
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+log_level_name = os.environ.get("ALEX_MCP_LOG_LEVEL", "INFO").upper()
+log_level = getattr(logging, log_level_name, logging.INFO)
+logging.basicConfig(level=log_level)
 logger = logging.getLogger(__name__)
 
 # Initialize FastMCP server
@@ -589,9 +591,9 @@ def autocomplete_authors_core(
             # No ranking, just take first N candidates
             final_candidates = filtered_candidates[:limit]
         
-        # Log final candidates
+        # Log final candidates (debug only)
         for candidate in final_candidates:
-            logger.info(f"   👤 {candidate.display_name} ({candidate.institution_hint or 'No institution'}) - {candidate.works_count} works")
+            logger.debug(f"   👤 {candidate.display_name} ({candidate.institution_hint or 'No institution'}) - {candidate.works_count} works")
         
         response = AutocompleteAuthorsResponse(
             query=name,
@@ -639,7 +641,21 @@ def search_works_core(
     search_type: str = "general",
     open_access_only: bool = False,
     has_abstract: bool = False,
-    sort: str = "relevance"
+    sort: str = "relevance",
+    include_authorships: bool = False,
+    include_locations: bool = False,
+    include_best_oa_location: bool = True,
+    include_references: bool = False,
+    include_related_works: bool = False,
+    include_abstract_inverted_index: bool = False,
+    include_fulltext_urls: bool = False,
+    max_authorships: int = 20,
+    max_locations: int = 5,
+    max_references: int = 50,
+    max_related_works: int = 20,
+    max_fulltext_urls: int = 3,
+    abstract_max_chars: int = 2000,
+    compact_ids: bool = False
 ) -> OptimizedGeneralWorksSearchResponse:
     """
     Core logic for searching works using OpenAlex with configurable search modes.
@@ -764,7 +780,23 @@ def search_works_core(
         optimized_works = []
         for work in results:
             try:
-                optimized_work = optimize_work_data(work)
+                optimized_work = optimize_work_data(
+                    work,
+                    include_authorships=include_authorships,
+                    include_locations=include_locations,
+                    include_best_oa_location=include_best_oa_location,
+                    include_references=include_references,
+                    include_related_works=include_related_works,
+                    include_abstract_inverted_index=include_abstract_inverted_index,
+                    include_fulltext_urls=include_fulltext_urls,
+                    max_authorships=max_authorships,
+                    max_locations=max_locations,
+                    max_references=max_references,
+                    max_related_works=max_related_works,
+                    max_fulltext_urls=max_fulltext_urls,
+                    abstract_max_chars=abstract_max_chars,
+                    compact_ids=compact_ids
+                )
                 optimized_works.append(optimized_work)
             except Exception as e:
                 logger.warning(f"Error optimizing work data: {e}")
@@ -807,6 +839,20 @@ def retrieve_author_works_core(
     journal_only: bool = True,  # Default to True for peer-reviewed content
     min_citations: Optional[int] = None,
     peer_reviewed_only: bool = True,  # Default to True
+    include_authorships: bool = False,
+    include_locations: bool = False,
+    include_best_oa_location: bool = True,
+    include_references: bool = False,
+    include_related_works: bool = False,
+    include_abstract_inverted_index: bool = False,
+    include_fulltext_urls: bool = False,
+    max_authorships: int = 20,
+    max_locations: int = 5,
+    max_references: int = 50,
+    max_related_works: int = 20,
+    max_fulltext_urls: int = 3,
+    abstract_max_chars: int = 2000,
+    compact_ids: bool = False,
 ) -> OptimizedWorksSearchResponse:
     """
     Enhanced core logic to retrieve peer-reviewed works for a given OpenAlex Author ID.
@@ -905,7 +951,23 @@ def retrieve_author_works_core(
         optimized_works = []
         for work_data in works:
             try:
-                optimized_work = optimize_work_data(work_data)
+                optimized_work = optimize_work_data(
+                    work_data,
+                    include_authorships=include_authorships,
+                    include_locations=include_locations,
+                    include_best_oa_location=include_best_oa_location,
+                    include_references=include_references,
+                    include_related_works=include_related_works,
+                    include_abstract_inverted_index=include_abstract_inverted_index,
+                    include_fulltext_urls=include_fulltext_urls,
+                    max_authorships=max_authorships,
+                    max_locations=max_locations,
+                    max_references=max_references,
+                    max_related_works=max_related_works,
+                    max_fulltext_urls=max_fulltext_urls,
+                    abstract_max_chars=abstract_max_chars,
+                    compact_ids=compact_ids
+                )
                 optimized_works.append(optimized_work)
             except Exception as e:
                 logger.warning(f"Error optimizing work data: {e}")
@@ -998,6 +1060,20 @@ async def retrieve_author_works(
     journal_only: bool = True,
     min_citations: Optional[int] = None,
     peer_reviewed_only: bool = True,
+    include_authorships: bool = False,
+    include_locations: bool = False,
+    include_best_oa_location: bool = True,
+    include_references: bool = False,
+    include_related_works: bool = False,
+    include_abstract_inverted_index: bool = False,
+    include_fulltext_urls: bool = False,
+    max_authorships: int = 20,
+    max_locations: int = 5,
+    max_references: int = 50,
+    max_related_works: int = 20,
+    max_fulltext_urls: int = 3,
+    abstract_max_chars: int = 2000,
+    compact_ids: bool = False,
 ) -> dict:
     """
     Enhanced MCP tool wrapper for retrieving author works with flexible filtering.
@@ -1043,6 +1119,20 @@ async def retrieve_author_works(
         journal_only=journal_only,
         min_citations=min_citations,
         peer_reviewed_only=peer_reviewed_only,
+        include_authorships=include_authorships,
+        include_locations=include_locations,
+        include_best_oa_location=include_best_oa_location,
+        include_references=include_references,
+        include_related_works=include_related_works,
+        include_abstract_inverted_index=include_abstract_inverted_index,
+        include_fulltext_urls=include_fulltext_urls,
+        max_authorships=max_authorships,
+        max_locations=max_locations,
+        max_references=max_references,
+        max_related_works=max_related_works,
+        max_fulltext_urls=max_fulltext_urls,
+        abstract_max_chars=abstract_max_chars,
+        compact_ids=compact_ids,
     )
     return response.model_dump()
 
@@ -1075,7 +1165,21 @@ async def search_works(
     search_type: str = "general",
     open_access_only: bool = False,
     has_abstract: bool = False,
-    sort: str = "relevance"
+    sort: str = "relevance",
+    include_authorships: bool = False,
+    include_locations: bool = False,
+    include_best_oa_location: bool = True,
+    include_references: bool = False,
+    include_related_works: bool = False,
+    include_abstract_inverted_index: bool = False,
+    include_fulltext_urls: bool = False,
+    max_authorships: int = 20,
+    max_locations: int = 5,
+    max_references: int = 50,
+    max_related_works: int = 20,
+    max_fulltext_urls: int = 3,
+    abstract_max_chars: int = 2000,
+    compact_ids: bool = False
 ) -> dict:
     """
     Optimized MCP tool wrapper for searching works with advanced filters.
@@ -1115,7 +1219,21 @@ async def search_works(
         search_type=search_type,
         open_access_only=open_access_only,
         has_abstract=has_abstract,
-        sort=sort
+        sort=sort,
+        include_authorships=include_authorships,
+        include_locations=include_locations,
+        include_best_oa_location=include_best_oa_location,
+        include_references=include_references,
+        include_related_works=include_related_works,
+        include_abstract_inverted_index=include_abstract_inverted_index,
+        include_fulltext_urls=include_fulltext_urls,
+        max_authorships=max_authorships,
+        max_locations=max_locations,
+        max_references=max_references,
+        max_related_works=max_related_works,
+        max_fulltext_urls=max_fulltext_urls,
+        abstract_max_chars=abstract_max_chars,
+        compact_ids=compact_ids
     )
     return response.model_dump()
 
@@ -1146,7 +1264,21 @@ async def search_works_smart(
     search_type: str = "general",
     open_access_only: bool = False,
     has_abstract: bool = False,
-    sort: str = "relevance"
+    sort: str = "relevance",
+    include_authorships: bool = False,
+    include_locations: bool = False,
+    include_best_oa_location: bool = True,
+    include_references: bool = False,
+    include_related_works: bool = False,
+    include_abstract_inverted_index: bool = False,
+    include_fulltext_urls: bool = False,
+    max_authorships: int = 20,
+    max_locations: int = 5,
+    max_references: int = 50,
+    max_related_works: int = 20,
+    max_fulltext_urls: int = 3,
+    abstract_max_chars: int = 2000,
+    compact_ids: bool = False
 ) -> dict:
     """
     Run multiple queries and deduplicate results by work ID.
@@ -1195,7 +1327,21 @@ async def search_works_smart(
             search_type=search_type,
             open_access_only=open_access_only,
             has_abstract=has_abstract,
-            sort=sort
+            sort=sort,
+            include_authorships=include_authorships,
+            include_locations=include_locations,
+            include_best_oa_location=include_best_oa_location,
+            include_references=include_references,
+            include_related_works=include_related_works,
+            include_abstract_inverted_index=include_abstract_inverted_index,
+            include_fulltext_urls=include_fulltext_urls,
+            max_authorships=max_authorships,
+            max_locations=max_locations,
+            max_references=max_references,
+            max_related_works=max_related_works,
+            max_fulltext_urls=max_fulltext_urls,
+            abstract_max_chars=abstract_max_chars,
+            compact_ids=compact_ids
         )
 
         per_query_counts[query] = len(response.results)
@@ -1886,17 +2032,31 @@ def normalize_work_id(work_id: str) -> str:
     annotations={
         "title": "Get Complete Work",
         "description": (
-            "Fetch a complete work object with all metadata: authorships (with IDs to avoid homonym ambiguity), "
-            "institutions, locations, best OA access, citation counts, and references. "
-            "Returns full author information with OpenAlex IDs (not just names). "
-            "Perfect for comprehensive research paper analysis and disambiguation. "
+            "Fetch a work object with rich metadata. Defaults to a compact payload to save tokens. "
+            "Use include_* flags to return authorships, locations, references, related works, or inverted abstracts. "
             "Accepts work IDs in multiple formats: W..., https://openalex.org/W..., etc."
         ),
         "readOnlyHint": True,
         "openWorldHint": True
     }
 )
-async def get_work(work_id: str) -> dict:
+async def get_work(
+    work_id: str,
+    include_authorships: bool = False,
+    include_locations: bool = False,
+    include_best_oa_location: bool = True,
+    include_references: bool = False,
+    include_related_works: bool = False,
+    include_abstract_inverted_index: bool = False,
+    include_fulltext_urls: bool = False,
+    max_authorships: int = 20,
+    max_locations: int = 5,
+    max_references: int = 50,
+    max_related_works: int = 20,
+    max_fulltext_urls: int = 3,
+    abstract_max_chars: int = 2000,
+    compact_ids: bool = False,
+) -> dict:
     """
     Fetch complete work object with full metadata.
     
@@ -1936,7 +2096,23 @@ async def get_work(work_id: str) -> dict:
             }
         
         # Convert to optimized format (which now includes full authorships)
-        optimized = optimize_work_data(work_obj)
+        optimized = optimize_work_data(
+            work_obj,
+            include_authorships=include_authorships,
+            include_locations=include_locations,
+            include_best_oa_location=include_best_oa_location,
+            include_references=include_references,
+            include_related_works=include_related_works,
+            include_abstract_inverted_index=include_abstract_inverted_index,
+            include_fulltext_urls=include_fulltext_urls,
+            max_authorships=max_authorships,
+            max_locations=max_locations,
+            max_references=max_references,
+            max_related_works=max_related_works,
+            max_fulltext_urls=max_fulltext_urls,
+            abstract_max_chars=abstract_max_chars,
+            compact_ids=compact_ids
+        )
         
         logger.info(f"✅ Successfully fetched work with {optimized.author_count or 0} authors")
         
@@ -1991,16 +2167,30 @@ def normalize_doi(doi: str) -> str:
     annotations={
         "title": "Get Work by DOI",
         "description": (
-            "Resolve a DOI to a complete work object with 100% reliability. "
-            "Accepts DOIs in multiple formats (10.xxxx/..., https://doi.org/10.xxxx/..., etc.). "
-            "Returns same rich metadata as get_work(): authorships with IDs, institutions, OA status, abstracts, etc. "
-            "Perfect for direct paper lookup without searching."
+            "Resolve a DOI to a work object with reliable lookup. Defaults to a compact payload to save tokens. "
+            "Use include_* flags to return authorships, locations, references, related works, or inverted abstracts."
         ),
         "readOnlyHint": True,
         "openWorldHint": True
     }
 )
-async def get_work_by_doi(doi: str) -> dict:
+async def get_work_by_doi(
+    doi: str,
+    include_authorships: bool = False,
+    include_locations: bool = False,
+    include_best_oa_location: bool = True,
+    include_references: bool = False,
+    include_related_works: bool = False,
+    include_abstract_inverted_index: bool = False,
+    include_fulltext_urls: bool = False,
+    max_authorships: int = 20,
+    max_locations: int = 5,
+    max_references: int = 50,
+    max_related_works: int = 20,
+    max_fulltext_urls: int = 3,
+    abstract_max_chars: int = 2000,
+    compact_ids: bool = False,
+) -> dict:
     """
     Fetch work by DOI with full metadata.
     
@@ -2038,7 +2228,23 @@ async def get_work_by_doi(doi: str) -> dict:
             }
         
         # Convert to optimized format
-        optimized = optimize_work_data(work_obj)
+        optimized = optimize_work_data(
+            work_obj,
+            include_authorships=include_authorships,
+            include_locations=include_locations,
+            include_best_oa_location=include_best_oa_location,
+            include_references=include_references,
+            include_related_works=include_related_works,
+            include_abstract_inverted_index=include_abstract_inverted_index,
+            include_fulltext_urls=include_fulltext_urls,
+            max_authorships=max_authorships,
+            max_locations=max_locations,
+            max_references=max_references,
+            max_related_works=max_related_works,
+            max_fulltext_urls=max_fulltext_urls,
+            abstract_max_chars=abstract_max_chars,
+            compact_ids=compact_ids
+        )
         
         logger.info(f"✅ Successfully resolved DOI to work")
         
@@ -2391,7 +2597,21 @@ async def get_fulltext_access(doi: str) -> dict:
 )
 async def enrich_work_data(
     work_id: str = None,
-    doi: str = None
+    doi: str = None,
+    include_authorships: bool = False,
+    include_locations: bool = False,
+    include_best_oa_location: bool = True,
+    include_references: bool = False,
+    include_related_works: bool = False,
+    include_abstract_inverted_index: bool = False,
+    include_fulltext_urls: bool = False,
+    max_authorships: int = 20,
+    max_locations: int = 5,
+    max_references: int = 50,
+    max_related_works: int = 20,
+    max_fulltext_urls: int = 3,
+    abstract_max_chars: int = 2000,
+    compact_ids: bool = False
 ) -> dict:
     """
     Get enriched work data with abstract and full-text access.
@@ -2440,7 +2660,23 @@ async def enrich_work_data(
             return {'error': 'Either work_id or doi must be provided'}
         
         # Convert to optimized format
-        optimized_work = optimize_work_data(work_data)
+        optimized_work = optimize_work_data(
+            work_data,
+            include_authorships=include_authorships,
+            include_locations=include_locations,
+            include_best_oa_location=include_best_oa_location,
+            include_references=include_references,
+            include_related_works=include_related_works,
+            include_abstract_inverted_index=include_abstract_inverted_index,
+            include_fulltext_urls=include_fulltext_urls,
+            max_authorships=max_authorships,
+            max_locations=max_locations,
+            max_references=max_references,
+            max_related_works=max_related_works,
+            max_fulltext_urls=max_fulltext_urls,
+            abstract_max_chars=abstract_max_chars,
+            compact_ids=compact_ids
+        )
         
         # Initialize enrichment metadata
         enrichment_metadata = {
@@ -2506,6 +2742,11 @@ async def enrich_work_data(
                 enrichment_metadata['abstract_source'] = 'openalex'
                 logger.info(f"✅ Using OpenAlex regular abstract: {len(openalex_abstract)} chars")
                 abstract_obtained = True
+
+        # Apply abstract truncation after enrichment
+        if optimized_work.abstract and abstract_max_chars and len(optimized_work.abstract) > abstract_max_chars:
+            optimized_work.abstract = optimized_work.abstract[:abstract_max_chars].rstrip() + "..."
+            optimized_work.abstract_truncated = True
         
         # Enrich with Unpaywall full-text access (if we have DOI)
         if work_doi:
@@ -2526,10 +2767,15 @@ async def enrich_work_data(
                         fulltext_urls.append(loc)
                 
                 if fulltext_urls:
-                    optimized_work.fulltext_urls = fulltext_urls
-                    enrichment_metadata['fulltext_source'] = 'unpaywall'
-                    enrichment_metadata['sources_used'].append('unpaywall')
-                    logger.info(f"✅ Full-text access enriched: {len(fulltext_urls)} locations")
+                    if include_fulltext_urls:
+                        if max_fulltext_urls and len(fulltext_urls) > max_fulltext_urls:
+                            optimized_work.fulltext_urls = fulltext_urls[:max_fulltext_urls]
+                            optimized_work.fulltext_urls_truncated = True
+                        else:
+                            optimized_work.fulltext_urls = fulltext_urls
+                        enrichment_metadata['fulltext_source'] = 'unpaywall'
+                        enrichment_metadata['sources_used'].append('unpaywall')
+                        logger.info(f"✅ Full-text access enriched: {len(fulltext_urls)} locations")
             else:
                 if fulltext_result.get('error'):
                     enrichment_metadata['errors'].append(f"Unpaywall: {fulltext_result['error']}")
@@ -2688,7 +2934,24 @@ async def get_top_authors_for_query(
         "openWorldHint": True
     }
 )
-async def batch_get_works(work_ids: list, chunk_size: int = 50) -> dict:
+async def batch_get_works(
+    work_ids: list,
+    chunk_size: int = 50,
+    include_authorships: bool = False,
+    include_locations: bool = False,
+    include_best_oa_location: bool = True,
+    include_references: bool = False,
+    include_related_works: bool = False,
+    include_abstract_inverted_index: bool = False,
+    include_fulltext_urls: bool = False,
+    max_authorships: int = 20,
+    max_locations: int = 5,
+    max_references: int = 50,
+    max_related_works: int = 20,
+    max_fulltext_urls: int = 3,
+    abstract_max_chars: int = 2000,
+    compact_ids: bool = False
+) -> dict:
     """
     Fetch multiple works with consolidated error handling.
     
@@ -2742,7 +3005,23 @@ async def batch_get_works(work_ids: list, chunk_size: int = 50) -> dict:
             try:
                 work_obj = pyalex.Works()[work_id]
                 if work_obj:
-                    optimized = optimize_work_data(work_obj)
+                    optimized = optimize_work_data(
+                        work_obj,
+                        include_authorships=include_authorships,
+                        include_locations=include_locations,
+                        include_best_oa_location=include_best_oa_location,
+                        include_references=include_references,
+                        include_related_works=include_related_works,
+                        include_abstract_inverted_index=include_abstract_inverted_index,
+                        include_fulltext_urls=include_fulltext_urls,
+                        max_authorships=max_authorships,
+                        max_locations=max_locations,
+                        max_references=max_references,
+                        max_related_works=max_related_works,
+                        max_fulltext_urls=max_fulltext_urls,
+                        abstract_max_chars=abstract_max_chars,
+                        compact_ids=compact_ids
+                    )
                     all_works.append(optimized.model_dump())
                 else:
                     all_errors.append({
