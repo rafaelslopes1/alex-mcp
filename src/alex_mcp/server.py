@@ -3536,8 +3536,11 @@ async def fetch_semantic_scholar_abstract(doi: str = None, title: str = None, op
             'User-Agent': f'alex-mcp (+{get_config()["OPENALEX_MAILTO"]})'
         }
         
+        # Create SSL context with certifi for certificate verification
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+            async with session.get(url, params=params, headers=headers, ssl=ssl_context, timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status == 200:
                     data = await response.json()
                     
@@ -3609,8 +3612,11 @@ async def search_semantic_scholar_by_title(title: str) -> dict:
             'User-Agent': f'alex-mcp (+{get_config()["OPENALEX_MAILTO"]})'
         }
         
+        # Create SSL context with certifi for certificate verification
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        
         async with aiohttp.ClientSession() as session:
-            async with session.get(base_url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+            async with session.get(base_url, params=params, headers=headers, ssl=ssl_context, timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status == 200:
                     data = await response.json()
                     papers = data.get('data', [])
