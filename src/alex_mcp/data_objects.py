@@ -25,6 +25,52 @@ class WorkIDs(BaseModel):
     mag: Optional[str] = None
 
 
+class InstitutionInfo(BaseModel):
+    """
+    Simplified institution information from author affiliations.
+    """
+    id: Optional[str] = None
+    display_name: Optional[str] = None
+    country_code: Optional[str] = None
+    type: Optional[str] = None
+
+
+class AuthorInfo(BaseModel):
+    """
+    Simplified author information (used in authorships).
+    """
+    id: str
+    display_name: str
+    orcid: Optional[str] = None
+
+
+class AuthorshipInfo(BaseModel):
+    """
+    Complete authorship entry with author and institution details.
+    
+    Preserves full authorship metadata to avoid homonym ambiguity.
+    """
+    author: AuthorInfo
+    institutions: Optional[List[InstitutionInfo]] = None
+    author_position: Optional[str] = None  # first, middle, last
+    is_corresponding: Optional[bool] = None
+
+
+class LocationInfo(BaseModel):
+    """
+    Complete publication location information (journal/repository).
+    
+    Includes OA status, license, and version information.
+    """
+    source_id: Optional[str] = None
+    source_name: Optional[str] = None
+    source_type: Optional[str] = None  # journal, repository
+    url: Optional[str] = None
+    is_oa: Optional[bool] = None
+    version: Optional[str] = None  # publishedVersion, acceptedVersion, submittedVersion
+    license: Optional[str] = None  # cc-by, cc0, etc
+
+
 class OptimizedAuthorResult(BaseModel):
     """
     Streamlined author representation focusing on disambiguation essentials.
@@ -64,41 +110,52 @@ class OptimizedWorkResult(BaseModel):
     Reduces token usage by ~80% compared to full OpenAlex work object while
     preserving comprehensive identifier information.
     
-    Enhanced with abstract and full-text access fields for enriched content.
+    Enhanced with abstract, full-text access, authorships, and locations.
     """
     id: str
     title: Optional[str] = None
     doi: Optional[str] = None  # Kept for backward compatibility
     publication_year: Optional[int] = None
+    publication_date: Optional[str] = None  # YYYY-MM-DD format
     type: Optional[str] = None  # journal-article, book-chapter, etc.
     
-    # COMPREHENSIVE ID INFORMATION - This was missing!
+    # COMPREHENSIVE ID INFORMATION
     ids: Optional[WorkIDs] = None
     
     # Citation metrics
     cited_by_count: Optional[int] = 0
     
-    # Publication venue (simplified)
+    # Publication venue
     journal_name: Optional[str] = None
     journal_issn: Optional[str] = None
     publisher: Optional[str] = None
     
-    # Open access info (simplified)
+    # Open access info
     is_open_access: Optional[bool] = None
     
-    # Author info (minimal)
+    # Author info - EXPANDED with full authorships list
     author_count: Optional[int] = None
-    first_author: Optional[str] = None
-    corresponding_author: Optional[str] = None
+    first_author: Optional[str] = None  # Kept for backward compatibility
+    corresponding_author: Optional[str] = None  # Kept for backward compatibility
+    authorships: Optional[List[AuthorshipInfo]] = None  # FULL authorships with IDs (NO homonym risk)
     
-    # Research categorization (simplified)
+    # Research categorization
     primary_field: Optional[str] = None
     concepts: Optional[List[str]] = None
     
     # ENHANCED CONTENT - Abstract and Full-text Access
     abstract: Optional[str] = None  # Complete abstract text (from Semantic Scholar or OpenAlex)
     abstract_inverted: Optional[bool] = None  # True if OpenAlex abstract is inverted/copyrighted
-    fulltext_urls: Optional[List[Dict[str, str]]] = None  # List of {url, source, license} dicts from Unpaywall
+    abstract_inverted_index: Optional[Dict[str, List[int]]] = None  # Raw inverted index for reconstruction fallback
+    fulltext_urls: Optional[List[Dict[str, str]]] = None  # List of {url, source, license} dicts
+    
+    # Locations and OA access - NEW
+    locations: Optional[List[LocationInfo]] = None  # All publication locations
+    best_oa_location: Optional[LocationInfo] = None  # Best legal OA PDF source
+    
+    # Citation graph - NEW
+    referenced_works: Optional[List[str]] = None  # Work IDs this paper cites
+    related_works: Optional[List[str]] = None  # Related work IDs from OpenAlex
 
 
 class OptimizedSearchResponse(BaseModel):
@@ -293,6 +350,103 @@ def extract_authorship_info(authorships: List[Dict[str, Any]]) -> tuple[Optional
     return author_count, first_author, corresponding_author
 
 
+def extract_full_authorships(authorships: List[Dict[str, Any]]) -> Optional[List[AuthorshipInfo]]:
+    """
+    Extract FULL authorships with author IDs and institutions (NO homonym risk).
+    
+    Args:
+        authorships: List of authorship objects from OpenAlex
+        
+    Returns:
+        List of AuthorshipInfo objects with complete disambiguation
+    """
+    if not authorships:
+        return None
+    
+    result = []
+    
+    for authorship in authorships:
+        author_data = authorship.get('author', {})
+        author_id = author_data.get('id')
+        author_name = author_data.get('display_name')
+        orcid = author_data.get('orcid')
+        
+        if not author_id or not author_name:
+            continue
+        
+        # Extract institutions
+        institutions = []
+        institutions_data = authorship.get('institutions', [])
+        for inst in institutions_data:
+            inst_id = inst.get('id')
+            inst_name = inst.get('display_name')
+            inst_country = inst.get('country_code')
+            inst_type = inst.get('type')
+            
+            if inst_name:
+                institutions.append(InstitutionInfo(
+                    id=inst_id,
+                    display_name=inst_name,
+                    country_code=inst_country,
+                    type=inst_type
+                ))
+        
+        result.append(AuthorshipInfo(
+            author=AuthorInfo(
+                id=author_id,
+                display_name=author_name,
+                orcid=orcid
+            ),
+            institutions=institutions if institutions else None,
+            author_position=authorship.get('author_position'),
+            is_corresponding=authorship.get('is_corresponding')
+        ))
+    
+    return result if result else None
+
+
+def extract_locations(locations: List[Dict[str, Any]]) -> tuple[Optional[List[LocationInfo]], Optional[LocationInfo]]:
+    """
+    Extract ALL locations and identify best OA location.
+    
+    Args:
+        locations: List of location objects from OpenAlex
+        
+    Returns:
+        tuple: (all_locations, best_oa_location)
+    """
+    if not locations:
+        return None, None
+    
+    all_locations = []
+    best_oa = None
+    
+    for location in locations:
+        source = location.get('source', {})
+        
+        loc = LocationInfo(
+            source_id=source.get('id'),
+            source_name=source.get('display_name'),
+            source_type=source.get('type'),
+            url=location.get('url'),
+            is_oa=location.get('is_oa'),
+            version=location.get('version'),
+            license=location.get('license')
+        )
+        
+        all_locations.append(loc)
+        
+        # Identify best OA location (prefer publisher/gold, then repository/green)
+        if location.get('is_oa') and loc.url:
+            if best_oa is None:
+                best_oa = loc
+            elif source.get('type') == 'journal' and best_oa and best_oa.source_type != 'journal':
+                # Prefer publisher over repository
+                best_oa = loc
+    
+    return (all_locations if all_locations else None), best_oa
+
+
 def extract_comprehensive_ids(work_data: Dict[str, Any]) -> WorkIDs:
     """
     Extract comprehensive identifier information from OpenAlex work data.
@@ -391,22 +545,27 @@ def optimize_work_data(work_data: Dict[str, Any]) -> OptimizedWorkResult:
     """
     Convert full OpenAlex work object to optimized version.
     
-    NOW INCLUDES COMPREHENSIVE ID EXTRACTION!
+    NOW INCLUDES:
+    - Comprehensive ID extraction
+    - Full authorships (by author.id, not name - NO homonym risk)
+    - All locations and best OA location
+    - Complete publication metadata
     
     Args:
         work_data: Full OpenAlex work object
         
     Returns:
-        OptimizedWorkResult with essential information AND comprehensive IDs
+        OptimizedWorkResult with all essential and enriched information
     """
     # Basic work info
     work_id = work_data.get('id', '')
     title = work_data.get('title')
-    doi = work_data.get('doi')  # Kept for backward compatibility
+    doi = work_data.get('doi')
     publication_year = work_data.get('publication_year')
+    publication_date = work_data.get('publication_date')
     work_type = work_data.get('type')
     
-    # EXTRACT COMPREHENSIVE IDS - This is the fix!
+    # Extract comprehensive IDs
     comprehensive_ids = extract_comprehensive_ids(work_data)
     
     # Citation metrics
@@ -416,13 +575,17 @@ def optimize_work_data(work_data: Dict[str, Any]) -> OptimizedWorkResult:
     locations = work_data.get('locations', [])
     journal_name, journal_issn, publisher = extract_journal_info(locations)
     
+    # Extract ALL locations and best OA
+    all_locations, best_oa_location = extract_locations(locations)
+    
     # Open access info
     open_access = work_data.get('open_access', {})
     is_open_access = open_access.get('is_oa') if open_access else None
     
-    # Authorship info
+    # Authorship info - EXTRACT BOTH simplified AND full
     authorships = work_data.get('authorships', [])
     author_count, first_author, corresponding_author = extract_authorship_info(authorships)
+    full_authorships = extract_full_authorships(authorships)
     
     # Research categorization
     primary_topic = work_data.get('primary_topic', {})
@@ -435,13 +598,22 @@ def optimize_work_data(work_data: Dict[str, Any]) -> OptimizedWorkResult:
         sorted_concepts = sorted(concepts, key=lambda x: x.get('score', 0), reverse=True)
         concept_names = [c.get('display_name') for c in sorted_concepts[:3] if c.get('display_name')]
     
+    # Extract abstract info (may be overridden by Semantic Scholar later)
+    abstract_inverted_index = work_data.get('abstract_inverted_index')
+    abstract_text = work_data.get('abstract')
+    
+    # Citation graph info
+    referenced_works = work_data.get('referenced_works', [])
+    related_works = work_data.get('related_works', [])
+    
     return OptimizedWorkResult(
         id=work_id,
         title=title,
-        doi=doi,  
+        doi=doi,
         publication_year=publication_year,
+        publication_date=publication_date,
         type=work_type,
-        ids=comprehensive_ids,  
+        ids=comprehensive_ids,
         cited_by_count=cited_by_count,
         journal_name=journal_name,
         journal_issn=journal_issn,
@@ -450,6 +622,13 @@ def optimize_work_data(work_data: Dict[str, Any]) -> OptimizedWorkResult:
         author_count=author_count,
         first_author=first_author,
         corresponding_author=corresponding_author,
+        authorships=full_authorships,  # FULL authorships - no homonym risk
         primary_field=primary_field,
-        concepts=concept_names if concept_names else None
+        concepts=concept_names if concept_names else None,
+        abstract=abstract_text,
+        abstract_inverted_index=abstract_inverted_index,
+        locations=all_locations,
+        best_oa_location=best_oa_location,
+        referenced_works=referenced_works if referenced_works else None,
+        related_works=related_works if related_works else None
     )

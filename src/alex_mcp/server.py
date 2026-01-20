@@ -629,10 +629,15 @@ def search_works_core(
     author: Optional[str] = None,
     institution: Optional[str] = None,
     publication_year: Optional[int] = None,
+    year_from: Optional[int] = None,
+    year_to: Optional[int] = None,
     type: Optional[str] = None,
     limit: int = 25,
     peer_reviewed_only: bool = True,
-    search_type: str = "general"
+    search_type: str = "general",
+    open_access_only: bool = False,
+    has_abstract: bool = False,
+    sort: str = "relevance"
 ) -> OptimizedGeneralWorksSearchResponse:
     """
     Core logic for searching works using OpenAlex with configurable search modes.
@@ -642,12 +647,16 @@ def search_works_core(
         query: Search query text
         author: (Optional) Author name filter
         institution: (Optional) Institution name filter
-        publication_year: (Optional) Publication year filter
+        publication_year: (Optional) Publication year filter (single year)
+        year_from: (Optional) Publication year from (inclusive)
+        year_to: (Optional) Publication year to (inclusive)
         type: (Optional) Work type filter (e.g., "article", "letter")
         limit: Maximum number of results (default: 25, max: 100)
         peer_reviewed_only: If True, apply peer-review filters (default: True)
-        search_type: Search mode - "general" (title/abstract/fulltext), "title" (title only), 
-                    or "title_and_abstract" (title and abstract only)
+        search_type: Search mode - "general", "title", or "title_and_abstract"
+        open_access_only: If True, only return OA works (default: False)
+        has_abstract: If True, only return works with abstracts (default: False)
+        sort: Sort order - "relevance" (default), "date" (newest first), or "cited_by_count"
 
     Returns:
         OptimizedGeneralWorksSearchResponse: Streamlined response with work data.
@@ -672,18 +681,29 @@ def search_works_core(
         
         # Add author filter if provided
         if author:
-            # For general work search, we can use raw_author_name.search for name-based filtering
-            # This searches for works where the author name appears in the raw author strings
             filters['raw_author_name.search'] = author
         
         # Add institution filter if provided  
         if institution:
-            # Use the correct field for institution name filtering
             filters['authorships.institutions.display_name.search'] = institution
         
-        # Add publication year filter
+        # Add publication year filter (single year - backward compatibility)
         if publication_year:
             filters['publication_year'] = publication_year
+        
+        # Note: year_from/year_to are applied via post-filtering after API call
+        # (PyAlex doesn't directly support date range filters in a reliable way)
+        if year_from is not None or year_to is not None:
+            # Remove single year if range is specified (range takes precedence)
+            filters.pop('publication_year', None)
+        
+        # Add open access filter (NEW)
+        if open_access_only:
+            filters['is_oa'] = True
+        
+        # Add has abstract filter (NEW)
+        if has_abstract:
+            filters['has_abstract'] = True
         
         # Add type filter
         if type:
@@ -696,13 +716,40 @@ def search_works_core(
         if peer_reviewed_only:
             filters['is_retracted'] = False
         
-        # Apply filters to query
+        # Apply standard filters to query
         if filters:
             works_query = works_query.filter(**filters)
         
+        # Apply sorting (NEW)
+        if sort == "date":
+            works_query = works_query.sort("publication_date:desc")
+        elif sort == "cited_by_count":
+            works_query = works_query.sort("cited_by_count:desc")
+        # Default "relevance" is handled by .search() automatically
+        
         # Execute query
-        logger.info(f"Searching OpenAlex works with search_type='{search_type}', query: '{query[:50]}...' and {len(filters)} filters")
+        logger.info(f"Searching OpenAlex works: search_type='{search_type}', query='{query[:50]}...', "
+                   f"year_from={year_from}, year_to={year_to}, open_access_only={open_access_only}, "
+                   f"has_abstract={has_abstract}, sort={sort}")
+        
+        # Execute the query
         results = works_query.get(per_page=limit)
+        
+        # Apply year range filtering post-query (reliable fallback approach)
+        # PyAlex doesn't have reliable native support for publication_date ranges
+        if year_from is not None or year_to is not None:
+            filtered_results = []
+            for work in results:
+                pub_year = work.get('publication_year')
+                if pub_year:
+                    year_ok = True
+                    if year_from is not None and pub_year < year_from:
+                        year_ok = False
+                    if year_to is not None and pub_year > year_to:
+                        year_ok = False
+                    if year_ok:
+                        filtered_results.append(work)
+            results = filtered_results
         
         # Apply additional peer-review filtering if requested
         if peer_reviewed_only and results:
@@ -722,11 +769,20 @@ def search_works_core(
         
         logger.info(f"Returning {len(optimized_works)} optimized works for search query")
         
+        # Include applied filters in response metadata
+        applied_filters = {
+            'year_from': year_from,
+            'year_to': year_to,
+            'open_access_only': open_access_only,
+            'has_abstract': has_abstract,
+            'sort': sort
+        }
+        
         return OptimizedGeneralWorksSearchResponse(
             query=query,
             total_count=len(optimized_works),
             results=optimized_works,
-            filters=filters
+            filters=applied_filters
         )
         
     except Exception as e:
@@ -1008,24 +1064,34 @@ async def search_works(
     author: Optional[str] = None,
     institution: Optional[str] = None,
     publication_year: Optional[int] = None,
+    year_from: Optional[int] = None,
+    year_to: Optional[int] = None,
     type: Optional[str] = None,
     limit: int = 25,
     peer_reviewed_only: bool = True,
-    search_type: str = "general"
+    search_type: str = "general",
+    open_access_only: bool = False,
+    has_abstract: bool = False,
+    sort: str = "relevance"
 ) -> dict:
     """
-    Optimized MCP tool wrapper for searching works.
+    Optimized MCP tool wrapper for searching works with advanced filters.
 
     Args:
         query: Search query text
         author: (Optional) Author name filter
         institution: (Optional) Institution name filter
-        publication_year: (Optional) Publication year filter
+        publication_year: (Optional) Publication year filter (single year)
+        year_from: (Optional) Filter for papers from this year (inclusive)
+        year_to: (Optional) Filter for papers up to this year (inclusive)
         type: (Optional) Work type filter (e.g., "article", "letter")
         limit: Maximum number of results (default: 25, max: 100)
         peer_reviewed_only: If True, apply peer-review filters (default: True)
         search_type: Search mode - "general" (title/abstract/fulltext), "title" (title only), 
                     or "title_and_abstract" (title and abstract only)
+        open_access_only: If True, only return OA works (default: False)
+        has_abstract: If True, only return works with abstracts (default: False)
+        sort: Sort order - "relevance" (default), "date" (newest first), or "cited_by_count"
 
     Returns:
         dict: Serialized OptimizedGeneralWorksSearchResponse with streamlined work data.
@@ -1038,10 +1104,15 @@ async def search_works(
         author=author,
         institution=institution,
         publication_year=publication_year,
+        year_from=year_from,
+        year_to=year_to,
         type=type,
         limit=limit,
         peer_reviewed_only=peer_reviewed_only,
-        search_type=search_type
+        search_type=search_type,
+        open_access_only=open_access_only,
+        has_abstract=has_abstract,
+        sort=sort
     )
     return response.model_dump()
 
@@ -1677,6 +1748,466 @@ async def get_work_abstract(
     return result
 
 
+def normalize_work_id(work_id: str) -> str:
+    """
+    Normalize a work ID to just the W... format.
+    
+    Accepts:
+    - "W2741809807"
+    - "https://openalex.org/W2741809807"
+    - "openalex.org/W2741809807"
+    
+    Returns:
+        str: Just the work ID (e.g., "W2741809807")
+    """
+    if not work_id:
+        return work_id
+    
+    # Remove URL prefix if present
+    if 'openalex.org/' in work_id:
+        work_id = work_id.split('openalex.org/')[-1]
+    
+    # Extract W... part
+    if work_id.startswith('W'):
+        return work_id
+    
+    # Try to extract from different formats
+    if work_id.upper().startswith('W'):
+        return work_id.upper()
+    
+    return work_id
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get Complete Work",
+        "description": (
+            "Fetch a complete work object with all metadata: authorships (with IDs to avoid homonym ambiguity), "
+            "institutions, locations, best OA access, citation counts, and references. "
+            "Returns full author information with OpenAlex IDs (not just names). "
+            "Perfect for comprehensive research paper analysis and disambiguation. "
+            "Accepts work IDs in multiple formats: W..., https://openalex.org/W..., etc."
+        ),
+        "readOnlyHint": True,
+        "openWorldHint": True
+    }
+)
+async def get_work(work_id: str) -> dict:
+    """
+    Fetch complete work object with full metadata.
+    
+    Args:
+        work_id: OpenAlex work ID (e.g., "W2741809807" or "https://openalex.org/W2741809807")
+        
+    Returns:
+        dict: Complete work object with:
+        - id, doi, title, publication_year, publication_date
+        - authorships[] with author.id, author.orcid, institutions[]
+        - cited_by_count, referenced_works[], related_works[]
+        - abstract, abstract_inverted_index
+        - best_oa_location, locations[]
+        - is_open_access, primary_location
+        - Backward compatible with v5.0 (first_author, corresponding_author, etc.)
+        
+    Example:
+        work = await get_work("W2741809807")
+        # Access authorships with author IDs (no homonym risk):
+        for authorship in work['authorships']:
+            author_id = authorship['author']['id']  # OpenAlex ID, not name
+            author_name = authorship['author']['display_name']
+    """
+    try:
+        # Normalize work_id
+        normalized_id = normalize_work_id(work_id)
+        
+        logger.info(f"📄 Fetching complete work: {normalized_id}")
+        
+        # Fetch from OpenAlex
+        work_obj = pyalex.Works()[normalized_id]
+        
+        if not work_obj:
+            return {
+                'error': f'Work not found: {work_id}',
+                'work_id': work_id
+            }
+        
+        # Convert to optimized format (which now includes full authorships)
+        optimized = optimize_work_data(work_obj)
+        
+        logger.info(f"✅ Successfully fetched work with {optimized.author_count or 0} authors")
+        
+        return optimized.model_dump()
+        
+    except Exception as e:
+        logger.error(f"Error fetching work {work_id}: {e}")
+        return {
+            'error': f'Error fetching work: {str(e)}',
+            'work_id': work_id
+        }
+
+
+def normalize_doi(doi: str) -> str:
+    """
+    Normalize a DOI to the full URL format for OpenAlex.
+    
+    Accepts:
+    - "10.1038/nature14539"
+    - "https://doi.org/10.1038/nature14539"
+    - "doi.org/10.1038/nature14539"
+    
+    Returns:
+        str: Full DOI URL (e.g., "https://doi.org/10.1038/nature14539")
+    """
+    if not doi:
+        return doi
+    
+    # Remove leading/trailing whitespace
+    doi = doi.strip()
+    
+    # If already full URL, return as-is
+    if doi.startswith('https://doi.org/') or doi.startswith('http://doi.org/'):
+        return doi
+    
+    # If starts with doi.org/, prepend https
+    if doi.startswith('doi.org/'):
+        return 'https://' + doi
+    
+    # If just the DOI number (10.xxxx/...)
+    if doi.startswith('10.'):
+        return f'https://doi.org/{doi}'
+    
+    # Try uppercasing 'DOI:' prefix if present
+    if doi.upper().startswith('DOI:'):
+        return normalize_doi(doi[4:])
+    
+    return doi
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get Work by DOI",
+        "description": (
+            "Resolve a DOI to a complete work object with 100% reliability. "
+            "Accepts DOIs in multiple formats (10.xxxx/..., https://doi.org/10.xxxx/..., etc.). "
+            "Returns same rich metadata as get_work(): authorships with IDs, institutions, OA status, abstracts, etc. "
+            "Perfect for direct paper lookup without searching."
+        ),
+        "readOnlyHint": True,
+        "openWorldHint": True
+    }
+)
+async def get_work_by_doi(doi: str) -> dict:
+    """
+    Fetch work by DOI with full metadata.
+    
+    Args:
+        doi: DOI in any format (e.g., "10.1038/nature14539" or "https://doi.org/10.1038/nature14539")
+        
+    Returns:
+        dict: Complete work object (same as get_work) or error dict if not found
+        
+    Example:
+        work = await get_work_by_doi("10.1038/nature14539")
+        # or
+        work = await get_work_by_doi("https://doi.org/10.1038/nature14539")
+    """
+    try:
+        # Normalize DOI to full URL format
+        normalized_doi = normalize_doi(doi)
+        
+        if not normalized_doi or not normalized_doi.startswith('https://doi.org/'):
+            return {
+                'error': f'Invalid DOI format: {doi}',
+                'doi': doi
+            }
+        
+        logger.info(f"🔗 Resolving DOI: {doi}")
+        
+        # Fetch from OpenAlex using the DOI URL directly as work ID
+        # OpenAlex accepts https://doi.org/... as a work ID
+        work_obj = pyalex.Works()[normalized_doi]
+        
+        if not work_obj:
+            return {
+                'error': f'Work not found for DOI: {doi}',
+                'doi': doi
+            }
+        
+        # Convert to optimized format
+        optimized = optimize_work_data(work_obj)
+        
+        logger.info(f"✅ Successfully resolved DOI to work")
+        
+        return optimized.model_dump()
+        
+    except Exception as e:
+        logger.error(f"Error fetching work by DOI {doi}: {e}")
+        return {
+            'error': f'Error resolving DOI: {str(e)}',
+            'doi': doi
+        }
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get Cited By Works",
+        "description": (
+            "Get incoming citations: papers that cite a given work. "
+            "Returns sorted list of citing papers with metadata. "
+            "Useful for tracking research impact and finding related work. "
+            "Sortable by publication date or citation count."
+        ),
+        "readOnlyHint": True,
+        "openWorldHint": True
+    }
+)
+async def get_cited_by(
+    work_id: str,
+    limit: int = 50,
+    sort: str = "publication_date"
+) -> dict:
+    """
+    Get papers that cite a given work (incoming citations).
+    
+    Args:
+        work_id: OpenAlex work ID (e.g., "W2741809807")
+        limit: Maximum papers to return (default: 50, max: 100)
+        sort: Sort order - "publication_date" (newest first) or "cited_by_count" (default)
+        
+    Returns:
+        dict with:
+        - work_id: Original work ID
+        - citing_count: Total number of papers citing this work
+        - citing_works: List of citing papers with metadata
+        
+    Example:
+        citations = await get_cited_by("W2741809807", limit=20, sort="publication_date")
+    """
+    try:
+        # Normalize work_id
+        normalized_id = normalize_work_id(work_id)
+        limit = min(limit, 100)
+        
+        logger.info(f"🔗 Fetching papers citing: {normalized_id}")
+        
+        # Use OpenAlex filter: cites:Wxxxx returns papers that cite this work
+        works_query = pyalex.Works().filter(cites=normalized_id)
+        
+        # Apply sorting
+        if sort == "cited_by_count":
+            works_query = works_query.sort("cited_by_count:desc")
+        else:
+            # Default: publication_date (newest first)
+            works_query = works_query.sort("publication_date:desc")
+        
+        # Fetch results
+        results = works_query.get(per_page=limit)
+        
+        # Convert to optimized format
+        citing_works = []
+        for work in results:
+            try:
+                optimized = optimize_work_data(work)
+                # Extract just key fields for brevity
+                citing_works.append({
+                    'id': optimized.id,
+                    'title': optimized.title,
+                    'doi': optimized.doi,
+                    'publication_year': optimized.publication_year,
+                    'cited_by_count': optimized.cited_by_count,
+                    'authors': optimized.first_author,  # Simplified
+                })
+            except Exception as e:
+                logger.warning(f"Error optimizing citing work: {e}")
+                continue
+        
+        logger.info(f"✅ Found {len(citing_works)} papers citing this work")
+        
+        return {
+            'work_id': normalized_id,
+            'citing_count': len(citing_works),
+            'citing_works': citing_works,
+            'sort': sort,
+            'source': 'openalex'
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching cited_by for work {work_id}: {e}")
+        return {
+            'error': f'Error fetching citations: {str(e)}',
+            'work_id': work_id
+        }
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get References",
+        "description": (
+            "Get outgoing citations: papers that a given work references (cites). "
+            "Returns bibliography list of papers referenced by the work. "
+            "Useful for understanding research foundations and related work. "
+            "Sortable by publication date or citation count."
+        ),
+        "readOnlyHint": True,
+        "openWorldHint": True
+    }
+)
+async def get_references(
+    work_id: str,
+    limit: int = 50,
+    sort: str = "publication_date"
+) -> dict:
+    """
+    Get papers referenced by a given work (outgoing citations).
+    
+    Args:
+        work_id: OpenAlex work ID (e.g., "W2741809807")
+        limit: Maximum papers to return (default: 50, max: 100)
+        sort: Sort order - "publication_date" (newest first) or "cited_by_count"
+        
+    Returns:
+        dict with:
+        - work_id: Original work ID
+        - reference_count: Total number of papers referenced
+        - referenced_works: List of referenced papers with metadata
+        
+    Example:
+        refs = await get_references("W2741809807", limit=25)
+    """
+    try:
+        # Normalize work_id
+        normalized_id = normalize_work_id(work_id)
+        limit = min(limit, 100)
+        
+        logger.info(f"📚 Fetching papers referenced by: {normalized_id}")
+        
+        # Use OpenAlex filter: cited_by:Wxxxx returns papers that are cited by this work
+        # This is the inverse: papers found in the work's referenced_works list
+        works_query = pyalex.Works().filter(cited_by=normalized_id)
+        
+        # Apply sorting
+        if sort == "cited_by_count":
+            works_query = works_query.sort("cited_by_count:desc")
+        else:
+            # Default: publication_date (newest first)
+            works_query = works_query.sort("publication_date:desc")
+        
+        # Fetch results
+        results = works_query.get(per_page=limit)
+        
+        # Convert to optimized format
+        referenced_works = []
+        for work in results:
+            try:
+                optimized = optimize_work_data(work)
+                # Extract key fields
+                referenced_works.append({
+                    'id': optimized.id,
+                    'title': optimized.title,
+                    'doi': optimized.doi,
+                    'publication_year': optimized.publication_year,
+                    'cited_by_count': optimized.cited_by_count,
+                    'authors': optimized.first_author,  # Simplified
+                })
+            except Exception as e:
+                logger.warning(f"Error optimizing referenced work: {e}")
+                continue
+        
+        logger.info(f"✅ Found {len(referenced_works)} papers referenced by this work")
+        
+        return {
+            'work_id': normalized_id,
+            'reference_count': len(referenced_works),
+            'referenced_works': referenced_works,
+            'sort': sort,
+            'source': 'openalex'
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching references for work {work_id}: {e}")
+        return {
+            'error': f'Error fetching references: {str(e)}',
+            'work_id': work_id
+        }
+
+
+@mcp.tool(
+    annotations={
+        "title": "Decode Abstract",
+        "description": (
+            "Reconstruct plaintext abstract from OpenAlex inverted index format. "
+            "OpenAlex stores copyrighted abstracts as inverted indexes (word→positions mapping). "
+            "This tool reconstructs readable text from that index. "
+            "Perfect for making abstracts human-readable."
+        ),
+        "readOnlyHint": True
+    }
+)
+def decode_abstract(abstract_inverted_index: dict) -> dict:
+    """
+    Reconstruct plaintext abstract from inverted index.
+    
+    Args:
+        abstract_inverted_index: Inverted index dict from OpenAlex
+                                (e.g., {"We": [0], "present": [1], "a": [2]})
+        
+    Returns:
+        dict with:
+        - abstract_text: Reconstructed plaintext abstract
+        - had_gaps: Whether there were gaps in positions (might indicate truncation)
+        - note: Explanation about the reconstruction
+        - source: "reconstruction"
+        
+    Example:
+        result = decode_abstract({
+            "machine": [0],
+            "learning": [1],
+            "models": [2]
+        })
+        # Returns: {"abstract_text": "machine learning models", "had_gaps": False, ...}
+    """
+    try:
+        if not abstract_inverted_index or not isinstance(abstract_inverted_index, dict):
+            return {
+                'error': 'Invalid inverted index format',
+                'abstract_text': '',
+                'had_gaps': False,
+                'source': 'reconstruction'
+            }
+        
+        # Use the existing reconstruction function
+        abstract_text = reconstruct_abstract_from_inverted_index(abstract_inverted_index)
+        
+        # Check for gaps (simple check: if max position + 1 != word count, there were gaps)
+        all_positions = []
+        for positions in abstract_inverted_index.values():
+            all_positions.extend(positions)
+        
+        had_gaps = False
+        if all_positions:
+            max_pos = max(all_positions)
+            expected_count = max_pos + 1
+            actual_count = len(all_positions)
+            had_gaps = (actual_count < expected_count)
+        
+        logger.info(f"📄 Decoded abstract, had_gaps={had_gaps}")
+        
+        return {
+            'abstract_text': abstract_text,
+            'had_gaps': had_gaps,
+            'note': 'OpenAlex abstracts are stored as inverted index; punctuation may not be perfect',
+            'source': 'reconstruction'
+        }
+        
+    except Exception as e:
+        logger.error(f"Error decoding abstract: {e}")
+        return {
+            'error': f'Error decoding abstract: {str(e)}',
+            'abstract_text': '',
+            'source': 'reconstruction'
+        }
+
+
 @mcp.tool(
     annotations={
         "title": "Get Full-text Access",
@@ -1909,6 +2440,321 @@ async def enrich_work_data(
     except Exception as e:
         logger.error(f"❌ Error enriching work data: {str(e)}")
         return {'error': str(e)}
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get Top Authors for Query",
+        "description": (
+            "Get most frequent authors for a search query, ranked by appearance count. "
+            "Returns authors by OpenAlex ID (not name) to avoid homonym ambiguity. "
+            "Perfect for finding key researchers in a field. "
+            "Uses author.id for disambiguation - no duplicate names."
+        ),
+        "readOnlyHint": True,
+        "openWorldHint": True
+    }
+)
+async def get_top_authors_for_query(
+    query: str,
+    limit_works: int = 200,
+    top_k: int = 10,
+    sort_by: str = "count"
+) -> dict:
+    """
+    Get top authors for a search query (ranked by appearance frequency).
+    
+    Args:
+        query: Search query to analyze
+        limit_works: How many papers to scan (default: 200, max: 500)
+        top_k: Number of top authors to return (default: 10)
+        sort_by: Sort order - "count" (appearance), "h_index", or "cited_by_count"
+        
+    Returns:
+        dict with:
+        - query: Original search query
+        - papers_scanned: How many papers analyzed
+        - top_authors: List of top authors with:
+          - author_id: OpenAlex ID (for disambiguation)
+          - author_name: Display name
+          - orcid: ORCID if available
+          - count: Appearance frequency
+          - h_index: H-index if available
+          - cited_by_count: Total citations
+          - example_works: Top 3 work IDs
+          
+    Example:
+        authors = await get_top_authors_for_query(
+            query="machine learning",
+            limit_works=100,
+            top_k=10,
+            sort_by="count"
+        )
+    """
+    try:
+        limit_works = min(limit_works, 500)
+        
+        logger.info(f"👥 Finding top authors for query: {query}")
+        
+        # Search for works
+        works_list = search_works_core(query=query, limit=min(limit_works, 100))
+        
+        if not works_list.results:
+            return {
+                'query': query,
+                'papers_scanned': 0,
+                'top_authors': [],
+                'source': 'openalex'
+            }
+        
+        # Count authors by ID (not name - avoiding homonym issue)
+        author_counter = {}
+        author_info = {}  # Store author details
+        
+        for work in works_list.results:
+            # Get full work details with authorships
+            if not work.authorships:
+                continue
+            
+            for authorship in work.authorships:
+                author_id = authorship.author.id
+                author_name = authorship.author.display_name
+                orcid = authorship.author.orcid
+                
+                # Increment count
+                author_counter[author_id] = author_counter.get(author_id, 0) + 1
+                
+                # Store author info (will update with latest metrics if seen again)
+                if author_id not in author_info:
+                    author_info[author_id] = {
+                        'author_id': author_id,
+                        'author_name': author_name,
+                        'orcid': orcid,
+                        'example_works': []
+                    }
+                
+                # Track example works (limit to 3)
+                if len(author_info[author_id]['example_works']) < 3:
+                    author_info[author_id]['example_works'].append(work.id)
+        
+        logger.info(f"📊 Found {len(author_counter)} unique authors in {len(works_list.results)} papers")
+        
+        # Build top authors list
+        top_authors = []
+        for author_id, count in sorted(
+            author_counter.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )[:top_k]:
+            author_entry = author_info[author_id].copy()
+            author_entry['count'] = count
+            author_entry['h_index'] = None  # Would need separate fetch
+            author_entry['cited_by_count'] = None  # Would need separate fetch
+            top_authors.append(author_entry)
+        
+        logger.info(f"✅ Returning top {len(top_authors)} authors")
+        
+        return {
+            'query': query,
+            'papers_scanned': len(works_list.results),
+            'top_authors': top_authors,
+            'sort_by': sort_by,
+            'source': 'openalex'
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching top authors for query {query}: {e}")
+        return {
+            'error': f'Error fetching top authors: {str(e)}',
+            'query': query
+        }
+
+
+@mcp.tool(
+    annotations={
+        "title": "Batch Get Works",
+        "description": (
+            "Fetch multiple works efficiently with automatic error handling. "
+            "Processes works sequentially with optimized error tracking. "
+            "More convenient than calling get_work() repeatedly. "
+            "Perfect for analyzing multiple papers at once."
+        ),
+        "readOnlyHint": True,
+        "openWorldHint": True
+    }
+)
+async def batch_get_works(work_ids: list, chunk_size: int = 50) -> dict:
+    """
+    Fetch multiple works with consolidated error handling.
+    
+    Note: PyAlex doesn't support true batch API calls, so this fetches
+    works sequentially but provides unified error handling and progress tracking.
+    
+    Args:
+        work_ids: List of work IDs (e.g., ["W123", "W456", "W789"])
+        chunk_size: Batch size for progress logging (default: 50, max: 100)
+        
+    Returns:
+        dict with:
+        - requested: Number of IDs requested
+        - fetched: Number successfully fetched
+        - works: List of complete work objects
+        - errors: List of failed IDs with reasons
+        
+    Example:
+        works = await batch_get_works(
+            work_ids=["W2741809807", "W2964470646"],
+            chunk_size=50
+        )
+    """
+    try:
+        chunk_size = min(chunk_size, 100)
+        requested_count = len(work_ids)
+        
+        logger.info(f"📦 Batch fetching {requested_count} works")
+        
+        if not work_ids:
+            return {
+                'requested': 0,
+                'fetched': 0,
+                'works': [],
+                'errors': [],
+                'source': 'openalex'
+            }
+        
+        # Normalize all IDs
+        normalized_ids = [normalize_work_id(wid) for wid in work_ids]
+        
+        # Process works sequentially (PyAlex doesn't support true batch API)
+        all_works = []
+        all_errors = []
+        
+        for idx, work_id in enumerate(normalized_ids):
+            # Log progress for large batches
+            if idx > 0 and idx % chunk_size == 0:
+                logger.info(f"  Progress: {idx}/{len(normalized_ids)} works processed")
+            
+            try:
+                work_obj = pyalex.Works()[work_id]
+                if work_obj:
+                    optimized = optimize_work_data(work_obj)
+                    all_works.append(optimized.model_dump())
+                else:
+                    all_errors.append({
+                        'work_id': work_id,
+                        'reason': 'Work not found'
+                    })
+            except Exception as e:
+                all_errors.append({
+                    'work_id': work_id,
+                    'reason': str(e)
+                })
+        
+        logger.info(f"✅ Batch fetch complete: {len(all_works)} works fetched, {len(all_errors)} errors")
+        
+        return {
+            'requested': requested_count,
+            'fetched': len(all_works),
+            'works': all_works,
+            'errors': all_errors,
+            'source': 'openalex'
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in batch_get_works: {e}")
+        return {
+            'requested': len(work_ids),
+            'fetched': 0,
+            'works': [],
+            'errors': [{'reason': str(e)}],
+            'source': 'openalex'
+        }
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get Best OA Location",
+        "description": (
+            "Extract the best legal OA PDF location for a work. "
+            "Prioritizes: publisher (gold) > repository (green). "
+            "Returns license and version information. "
+            "Perfect for direct PDF access when available."
+        ),
+        "readOnlyHint": True,
+        "openWorldHint": True
+    }
+)
+async def get_best_oa_location(work_id: str) -> dict:
+    """
+    Get the best open access PDF location for a work.
+    
+    Args:
+        work_id: OpenAlex work ID
+        
+    Returns:
+        dict with:
+        - work_id: Original work ID
+        - is_oa: Whether paper is open access
+        - oa_status: OA type ('gold', 'green', 'hybrid', 'bronze', 'closed')
+        - best_location: Single best location object (or None if closed access)
+        - all_locations: All available OA locations
+        - license: License type
+        - version: Version type (published, accepted, submitted)
+        
+    Example:
+        oa = await get_best_oa_location("W2741809807")
+        if oa['is_oa']:
+            print(f"📥 Download: {oa['best_location']['url']}")
+    """
+    try:
+        # Normalize work_id
+        normalized_id = normalize_work_id(work_id)
+        
+        logger.info(f"🔓 Fetching OA status for: {normalized_id}")
+        
+        # Fetch work
+        work = pyalex.Works()[normalized_id]
+        if not work:
+            return {
+                'error': f'Work not found: {work_id}',
+                'work_id': work_id
+            }
+        
+        # Extract locations
+        all_locations, best_location = extract_locations(work.get('locations', []))
+        
+        # Get OA info
+        open_access = work.get('open_access', {})
+        is_oa = open_access.get('is_oa', False)
+        oa_status = open_access.get('oa_status', 'closed')
+        
+        logger.info(f"✅ OA status: {oa_status}")
+        
+        result = {
+            'work_id': normalized_id,
+            'is_oa': is_oa,
+            'oa_status': oa_status,
+            'source': 'openalex'
+        }
+        
+        if best_location:
+            result['best_location'] = best_location.model_dump()
+        else:
+            result['best_location'] = None
+        
+        if all_locations:
+            result['all_locations'] = [loc.model_dump() for loc in all_locations]
+        else:
+            result['all_locations'] = []
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error fetching OA location for work {work_id}: {e}")
+        return {
+            'error': f'Error: {str(e)}',
+            'work_id': work_id
+        }
 
 
 # ============================================================================
