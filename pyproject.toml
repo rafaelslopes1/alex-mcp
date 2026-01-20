@@ -25,7 +25,8 @@ dependencies = [
     "pydantic>=2.7.2",
     "rich>=13.9.4",
     "pyalex==0.18",
-    "aiohttp>=3.8.0"
+    "aiohttp>=3.8.0",
+    "certifi>=2024.12.14"
 ]
 
 [project.urls]

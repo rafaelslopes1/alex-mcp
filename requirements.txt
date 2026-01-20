@@ -7,6 +7,7 @@ mcp>=1.2.0
 # HTTP client for OpenAlex API and ORCID integration
 httpx>=0.25.0
 aiohttp>=3.8.0
+certifi>=2024.12.14
 
 # Optional: For enhanced logging and debugging
 rich>=13.0.0

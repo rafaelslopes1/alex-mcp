@@ -28,6 +28,8 @@ import asyncio
 import json
 import re
 import time
+import ssl
+import certifi
 from collections import OrderedDict
 from datetime import datetime, timedelta
 
@@ -699,7 +701,8 @@ def search_works_core(
         
         # Add open access filter (NEW)
         if open_access_only:
-            filters['is_oa'] = True
+            # OpenAlex filter syntax: is_oa:true
+            filters['is_oa'] = 'true'
         
         # Add has abstract filter (NEW)
         if has_abstract:
@@ -1115,6 +1118,107 @@ async def search_works(
         sort=sort
     )
     return response.model_dump()
+
+
+@mcp.tool(
+    annotations={
+        "title": "Search Works (Smart Multi-Query)",
+        "description": (
+            "Run multiple work queries and merge results with deduplication by OpenAlex ID. "
+            "Useful for synonyms, multilingual queries, or expanded keyword sets. "
+            "Returns a unified, deduplicated result set." 
+        ),
+        "readOnlyHint": True,
+        "openWorldHint": True
+    }
+)
+async def search_works_smart(
+    queries: list,
+    author: Optional[str] = None,
+    institution: Optional[str] = None,
+    publication_year: Optional[int] = None,
+    year_from: Optional[int] = None,
+    year_to: Optional[int] = None,
+    type: Optional[str] = None,
+    limit_per_query: int = 15,
+    total_limit: int = 50,
+    peer_reviewed_only: bool = True,
+    search_type: str = "general",
+    open_access_only: bool = False,
+    has_abstract: bool = False,
+    sort: str = "relevance"
+) -> dict:
+    """
+    Run multiple queries and deduplicate results by work ID.
+
+    Args:
+        queries: List of query strings
+        limit_per_query: Max results per query (default: 15)
+        total_limit: Max total unique results after deduplication (default: 50)
+        Other args mirror search_works filters
+
+    Returns:
+        dict with:
+        - queries: List of queries executed
+        - total_count: Total unique works after deduplication
+        - results: Deduplicated works
+        - per_query_counts: Raw counts per query
+        - raw_total: Total raw results before deduplication
+    """
+    if not queries or not isinstance(queries, list):
+        return {
+            'error': 'queries must be a non-empty list of strings',
+            'queries': queries or []
+        }
+
+    limit_per_query = min(max(limit_per_query, 1), 100)
+    total_limit = min(max(total_limit, 1), 200)
+
+    deduped = OrderedDict()
+    per_query_counts = {}
+    raw_total = 0
+
+    for query in queries:
+        if not isinstance(query, str) or not query.strip():
+            continue
+
+        response = search_works_core(
+            query=query,
+            author=author,
+            institution=institution,
+            publication_year=publication_year,
+            year_from=year_from,
+            year_to=year_to,
+            type=type,
+            limit=limit_per_query,
+            peer_reviewed_only=peer_reviewed_only,
+            search_type=search_type,
+            open_access_only=open_access_only,
+            has_abstract=has_abstract,
+            sort=sort
+        )
+
+        per_query_counts[query] = len(response.results)
+        raw_total += len(response.results)
+
+        for work in response.results:
+            if work.id not in deduped:
+                deduped[work.id] = work
+                if len(deduped) >= total_limit:
+                    break
+        if len(deduped) >= total_limit:
+            break
+
+    results = [work.model_dump() for work in list(deduped.values())[:total_limit]]
+
+    return {
+        'queries': queries,
+        'total_count': len(results),
+        'results': results,
+        'per_query_counts': per_query_counts,
+        'raw_total': raw_total,
+        'deduplicated': raw_total - len(results)
+    }
 
 
 @mcp.tool(
@@ -2215,7 +2319,8 @@ def decode_abstract(abstract_inverted_index: dict) -> dict:
             "Get legal open access PDF links for a paper using Unpaywall API. "
             "Returns direct links to publisher PDFs and repository versions. "
             "100% legal - only provides links to legitimately open access content. "
-            "Includes license information and version details (published/accepted/submitted)."
+            "Includes license information and version details (published/accepted/submitted). "
+            "Intended as a fallback when OpenAlex OA metadata is missing or incomplete."
         ),
         "readOnlyHint": True,
         "openWorldHint": True
@@ -2678,18 +2783,19 @@ async def batch_get_works(work_ids: list, chunk_size: int = 50) -> dict:
             "Extract the best legal OA PDF location for a work. "
             "Prioritizes: publisher (gold) > repository (green). "
             "Returns license and version information. "
-            "Perfect for direct PDF access when available."
+            "Accepts OpenAlex work_id or DOI; falls back to Unpaywall if OpenAlex lacks OA metadata."
         ),
         "readOnlyHint": True,
         "openWorldHint": True
     }
 )
-async def get_best_oa_location(work_id: str) -> dict:
+async def get_best_oa_location(work_id: str = None, doi: str = None) -> dict:
     """
     Get the best open access PDF location for a work.
     
     Args:
         work_id: OpenAlex work ID
+        doi: DOI in any format (optional)
         
     Returns:
         dict with:
@@ -2702,19 +2808,53 @@ async def get_best_oa_location(work_id: str) -> dict:
         - version: Version type (published, accepted, submitted)
         
     Example:
-        oa = await get_best_oa_location("W2741809807")
+        oa = await get_best_oa_location(work_id="W2741809807")
         if oa['is_oa']:
             print(f"📥 Download: {oa['best_location']['url']}")
+
+        # Or by DOI
+        oa = await get_best_oa_location(doi="10.1038/nature14539")
     """
     try:
-        # Normalize work_id
-        normalized_id = normalize_work_id(work_id)
-        
-        logger.info(f"🔓 Fetching OA status for: {normalized_id}")
-        
-        # Fetch work
-        work = pyalex.Works()[normalized_id]
+        if not work_id and not doi:
+            return {
+                'error': 'Either work_id or doi must be provided'
+            }
+
+        normalized_id = None
+        normalized_doi = None
+        work = None
+
+        if work_id:
+            normalized_id = normalize_work_id(work_id)
+            logger.info(f"🔓 Fetching OA status for: {normalized_id}")
+            work = pyalex.Works()[normalized_id]
+
+        if not work and doi:
+            normalized_doi = normalize_doi(doi)
+            if not normalized_doi or not normalized_doi.startswith('https://doi.org/'):
+                return {
+                    'error': f'Invalid DOI format: {doi}',
+                    'doi': doi
+                }
+            logger.info(f"🔓 Fetching OA status for DOI: {doi}")
+            work = pyalex.Works()[normalized_doi]
+
         if not work:
+            if normalized_doi or doi:
+                # Fallback to Unpaywall directly when OpenAlex lookup fails
+                fallback_doi = normalized_doi or normalize_doi(doi)
+                logger.info("🔄 Falling back to Unpaywall for OA metadata")
+                fallback = await fetch_unpaywall_links(fallback_doi)
+                return {
+                    'work_id': normalized_id,
+                    'doi': fallback.get('doi') or fallback_doi,
+                    'is_oa': fallback.get('is_oa', False),
+                    'oa_status': fallback.get('oa_status', 'closed'),
+                    'best_location': fallback.get('best_oa_location'),
+                    'all_locations': fallback.get('oa_locations', []),
+                    'source': 'unpaywall'
+                }
             return {
                 'error': f'Work not found: {work_id}',
                 'work_id': work_id
@@ -2731,7 +2871,8 @@ async def get_best_oa_location(work_id: str) -> dict:
         logger.info(f"✅ OA status: {oa_status}")
         
         result = {
-            'work_id': normalized_id,
+            'work_id': normalized_id or normalize_work_id(work.get('id', '')),
+            'doi': work.get('doi') or (work.get('ids', {}) or {}).get('doi'),
             'is_oa': is_oa,
             'oa_status': oa_status,
             'source': 'openalex'
@@ -2747,6 +2888,21 @@ async def get_best_oa_location(work_id: str) -> dict:
         else:
             result['all_locations'] = []
         
+        # Fallback to Unpaywall if OpenAlex lacks OA metadata or locations
+        if (not is_oa or not best_location) and (doi or result.get('doi')):
+            fallback_doi = normalize_doi(doi or result.get('doi'))
+            if fallback_doi and fallback_doi.startswith('https://doi.org/'):
+                logger.info("🔄 OpenAlex OA incomplete; falling back to Unpaywall")
+                fallback = await fetch_unpaywall_links(fallback_doi)
+                if fallback.get('is_oa') and (fallback.get('best_oa_location') or fallback.get('oa_locations')):
+                    result.update({
+                        'is_oa': fallback.get('is_oa', result['is_oa']),
+                        'oa_status': fallback.get('oa_status', result['oa_status']),
+                        'best_location': fallback.get('best_oa_location'),
+                        'all_locations': fallback.get('oa_locations', result.get('all_locations', [])),
+                        'source': 'unpaywall_fallback'
+                    })
+
         return result
         
     except Exception as e:
@@ -3233,8 +3389,14 @@ async def fetch_unpaywall_links(doi: str) -> dict:
             'User-Agent': f'alex-mcp (+{email})'
         }
         
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+            async with session.get(
+                url,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10),
+                ssl=ssl_context
+            ) as response:
                 if response.status == 200:
                     data = await response.json()
                     
