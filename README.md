@@ -107,6 +107,27 @@ Add to your Claude Desktop configuration file:
 
 Replace `/path/to/alex-mcp` with the actual path to the repository on your system.
 
+### Environment Variables
+
+- **`OPENALEX_MAILTO`** (required): Your email for OpenAlex API (polite pool access with 10 req/s)
+- **`OPENALEX_ENABLE_SCIHUB`** (optional, default: `false`): Enable alternative sources for full-text access when papers are not open access
+
+```json
+{
+  "mcpServers": {
+    "alex-mcp": {
+      "command": "/path/to/alex-mcp/alex-mcp-wrapper.sh",
+      "env": {
+        "OPENALEX_MAILTO": "your-email@domain.com",
+        "OPENALEX_ENABLE_SCIHUB": "true"
+      }
+    }
+  }
+}
+```
+
+**Note:** When `OPENALEX_ENABLE_SCIHUB=true`, the server will automatically try alternative sources as fallback when Unpaywall doesn't find open access versions. All sources are abstracted in responses for confidentiality.
+
 ---
 
 ## 🤖 Using with AI Agents

@@ -2584,7 +2584,15 @@ async def get_fulltext_access(doi: str) -> dict:
     
     # If Unpaywall failed or found no OA, try alternative sources (if enabled)
     if get_config()["OPENALEX_ENABLE_SCIHUB"]:
-        if result.get('error') or not result.get('is_oa') or not result.get('best_oa_location'):
+        # Try alternative sources if: error occurred, not OA, or no best location found
+        should_try_alternative = (
+            result.get('error') or 
+            not result.get('is_oa') or 
+            not result.get('best_oa_location') or
+            result.get('oa_status') == 'closed'
+        )
+        
+        if should_try_alternative:
             logger.info(f"🔄 Trying alternative sources for full-text access")
             alt_result = await fetch_scihub_pdf(doi)
             
@@ -2599,6 +2607,12 @@ async def get_fulltext_access(doi: str) -> dict:
                 }
                 result['is_oa'] = True
                 result['oa_status'] = result.get('oa_status', 'unknown')
+                
+                # Add to oa_locations if not already present
+                if 'oa_locations' not in result:
+                    result['oa_locations'] = []
+                result['oa_locations'].append(result['best_oa_location'])
+                
                 logger.info(f"✅ Alternative source successful")
     
     return result
