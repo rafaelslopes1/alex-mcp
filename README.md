@@ -215,7 +215,129 @@ candidates = await autocomplete_authors(
 # Much more accurate than single search result!
 ```
 
-### 2. **search_authors**
+### 2. **get_work_abstract** 🆕 Enhanced Content
+Fetch complete, readable abstract from Semantic Scholar (non-inverted).
+
+**Parameters:**
+- `doi` (optional): DOI of the paper (preferred)
+- `title` (optional): Paper title (fallback)
+- `openalex_id` (optional): OpenAlex work ID
+
+**Key Features:**
+- 📄 **Complete Abstracts**: Full text, not alphabetically sorted
+- 🎯 **AI-Powered Metrics**: Influential citation counts
+- 📁 **PDF Access**: Open access PDF links when available
+- 🆓 **Free API**: No authentication required
+
+**Output:**
+```json
+{
+  "abstract": "We present a novel approach to...",
+  "source": "semantic_scholar",
+  "paper_id": "204e3073870fae3d05bcbc2f6a8e263d9b72e776",
+  "citation_count": 1234,
+  "influential_citation_count": 89,
+  "open_access_pdf": "https://arxiv.org/pdf/1706.03762.pdf"
+}
+```
+
+**Usage:**
+```python
+# Get abstract by DOI
+abstract_data = await get_work_abstract(
+    doi="10.1038/s41587-024-02534-3"
+)
+
+# Fallback to title search
+abstract_data = await get_work_abstract(
+    title="Attention Is All You Need"
+)
+```
+
+### 3. **get_fulltext_access** 🆕 Enhanced Content
+Get legal open access PDF links via Unpaywall.
+
+**Parameters:**
+- `doi` (required): DOI of the paper
+
+**Key Features:**
+- 📕 **100% Legal**: Only legitimate open access content
+- 🏆 **Multiple Sources**: Publisher + repository versions
+- ⚖️ **License Info**: Clear licensing information
+- 📦 **Version Control**: Published/accepted/submitted versions
+
+**Output:**
+```json
+{
+  "is_oa": true,
+  "oa_status": "gold",
+  "best_oa_location": {
+    "url": "https://www.nature.com/articles/s41587-024-02534-3.pdf",
+    "host_type": "publisher",
+    "license": "cc-by",
+    "version": "publishedVersion"
+  },
+  "oa_locations": [...]
+}
+```
+
+**Usage:**
+```python
+# Get full-text access
+fulltext = await get_fulltext_access(
+    doi="10.1038/s41587-024-02534-3"
+)
+
+if fulltext['is_oa']:
+    pdf_url = fulltext['best_oa_location']['url']
+    print(f"Download: {pdf_url}")
+```
+
+### 4. **enrich_work_data** 🆕 Enhanced Content
+Get comprehensive work data with abstract and full-text in one call.
+
+**Parameters:**
+- `work_id` (optional): OpenAlex work ID
+- `doi` (optional): DOI of the paper
+
+**Key Features:**
+- 🎁 **All-in-One**: OpenAlex + Semantic Scholar + Unpaywall
+- 📊 **Complete**: Metadata + abstract + PDF links
+- 🎯 **Optimized**: Single call for full enrichment
+- 📝 **Metadata**: Shows which sources succeeded
+
+**Output:**
+```json
+{
+  "id": "https://openalex.org/W1234567890",
+  "title": "...",
+  "abstract": "Complete abstract text...",
+  "abstract_inverted": false,
+  "fulltext_urls": [{
+    "url": "https://...",
+    "host_type": "publisher",
+    "license": "cc-by"
+  }],
+  "enrichment_metadata": {
+    "sources_used": ["openalex", "semantic_scholar", "unpaywall"],
+    "abstract_source": "semantic_scholar",
+    "fulltext_source": "unpaywall"
+  }
+}
+```
+
+**Usage:**
+```python
+# Get everything in one call
+enriched = await enrich_work_data(
+    doi="10.1038/s41587-024-02534-3"
+)
+
+print(f"Abstract: {enriched['abstract'][:200]}...")
+print(f"PDF: {enriched['fulltext_urls'][0]['url']}")
+```
+
+### 5. **search_authors**
 Search for authors with streamlined output for AI agents.
 
 **Parameters:**
@@ -225,52 +347,11 @@ Search for authors with streamlined output for AI agents.
 - `country_code` (optional): Country code filter (e.g., "US", "DE")
 - `limit` (optional): Maximum results (1-25, default: 20)
 
-**Streamlined Output:**
-```json
-{
-  "query": "J. Abreu",
-  "total_count": 3,
-  "results": [
-    {
-      "id": "https://openalex.org/A123456789",
-      "display_name": "Jorge Abreu-Vicente",
-      "orcid": "https://orcid.org/0000-0000-0000-0000",
-      "display_name_alternatives": ["J. Abreu-Vicente", "Jorge Abreu Vicente"],
-      "affiliations": [
-        {
-          "institution": {
-            "display_name": "European Molecular Biology Organization",
-            "country_code": "DE"
-          },
-          "years": [2023, 2024, 2025]
-        }
-      ],
-      "cited_by_count": 316,
-      "works_count": 25,
-      "summary_stats": {
-        "h_index": 9,
-        "i10_index": 5
-      },
-      "x_concepts": [
-        {
-          "display_name": "Astrophysics",
-          "score": 0.8
-        },
-        {
-          "display_name": "Machine Learning", 
-          "score": 0.6
-        }
-      ]
-    }
-  ]
-}
-```
-
 **Features**: Clean structure optimized for AI reasoning and disambiguation
 
 ---
 
-### 2. **retrieve_author_works**
+### 6. **retrieve_author_works**
 Retrieve works for a given author with enhanced filtering capabilities.
 
 **Parameters:**

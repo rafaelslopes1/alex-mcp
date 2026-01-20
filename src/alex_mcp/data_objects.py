@@ -63,6 +63,8 @@ class OptimizedWorkResult(BaseModel):
     
     Reduces token usage by ~80% compared to full OpenAlex work object while
     preserving comprehensive identifier information.
+    
+    Enhanced with abstract and full-text access fields for enriched content.
     """
     id: str
     title: Optional[str] = None
@@ -92,6 +94,11 @@ class OptimizedWorkResult(BaseModel):
     # Research categorization (simplified)
     primary_field: Optional[str] = None
     concepts: Optional[List[str]] = None
+    
+    # ENHANCED CONTENT - Abstract and Full-text Access
+    abstract: Optional[str] = None  # Complete abstract text (from Semantic Scholar or OpenAlex)
+    abstract_inverted: Optional[bool] = None  # True if OpenAlex abstract is inverted/copyrighted
+    fulltext_urls: Optional[List[Dict[str, str]]] = None  # List of {url, source, license} dicts from Unpaywall
 
 
 class OptimizedSearchResponse(BaseModel):

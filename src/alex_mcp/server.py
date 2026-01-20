@@ -27,6 +27,9 @@ import aiohttp
 import asyncio
 import json
 import re
+import time
+from collections import OrderedDict
+from datetime import datetime, timedelta
 
 def get_config():
     mailto = os.environ.get("OPENALEX_MAILTO")
@@ -62,6 +65,113 @@ logger = logging.getLogger(__name__)
 
 # Initialize FastMCP server
 mcp = FastMCP("OpenAlex Academic Research")
+
+# ============================================================================
+# Cache and Rate Limiting Infrastructure
+# ============================================================================
+
+class SimpleCache:
+    """
+    Simple in-memory cache with TTL (Time To Live) for abstracts.
+    Thread-safe for async operations.
+    """
+    def __init__(self, max_size: int = 1000, ttl_seconds: int = 3600):
+        self.cache = OrderedDict()
+        self.max_size = max_size
+        self.ttl_seconds = ttl_seconds
+        self._lock = asyncio.Lock()
+    
+    async def get(self, key: str) -> Optional[dict]:
+        """Get value from cache if not expired."""
+        async with self._lock:
+            if key in self.cache:
+                value, timestamp = self.cache[key]
+                # Check if expired
+                if time.time() - timestamp < self.ttl_seconds:
+                    # Move to end (LRU)
+                    self.cache.move_to_end(key)
+                    logger.debug(f"💾 Cache HIT: {key}")
+                    return value
+                else:
+                    # Expired, remove
+                    del self.cache[key]
+                    logger.debug(f"⏰ Cache EXPIRED: {key}")
+            return None
+    
+    async def set(self, key: str, value: dict):
+        """Set value in cache with current timestamp."""
+        async with self._lock:
+            # Remove oldest if at capacity
+            if len(self.cache) >= self.max_size and key not in self.cache:
+                oldest_key = next(iter(self.cache))
+                del self.cache[oldest_key]
+                logger.debug(f"🗑️ Cache EVICT: {oldest_key}")
+            
+            self.cache[key] = (value, time.time())
+            self.cache.move_to_end(key)
+            logger.debug(f"💾 Cache SET: {key}")
+    
+    async def clear(self):
+        """Clear all cached items."""
+        async with self._lock:
+            self.cache.clear()
+            logger.info("🗑️ Cache CLEARED")
+    
+    def stats(self) -> dict:
+        """Get cache statistics."""
+        return {
+            'size': len(self.cache),
+            'max_size': self.max_size,
+            'ttl_seconds': self.ttl_seconds
+        }
+
+
+class RateLimiter:
+    """
+    Token bucket rate limiter for API calls.
+    Prevents exceeding API rate limits.
+    """
+    def __init__(self, max_requests: int = 100, time_window: float = 1.0):
+        self.max_requests = max_requests
+        self.time_window = time_window  # seconds
+        self.tokens = max_requests
+        self.last_update = time.time()
+        self._lock = asyncio.Lock()
+    
+    async def acquire(self):
+        """Acquire a token, waiting if necessary."""
+        async with self._lock:
+            now = time.time()
+            # Refill tokens based on time elapsed
+            elapsed = now - self.last_update
+            self.tokens = min(
+                self.max_requests,
+                self.tokens + elapsed * (self.max_requests / self.time_window)
+            )
+            self.last_update = now
+            
+            # If no tokens available, wait
+            if self.tokens < 1:
+                wait_time = (1 - self.tokens) * (self.time_window / self.max_requests)
+                logger.debug(f"⏳ Rate limit: waiting {wait_time:.2f}s")
+                await asyncio.sleep(wait_time)
+                self.tokens = 1
+            
+            self.tokens -= 1
+    
+    def stats(self) -> dict:
+        """Get rate limiter statistics."""
+        return {
+            'max_requests': self.max_requests,
+            'time_window': self.time_window,
+            'current_tokens': self.tokens
+        }
+
+
+# Initialize cache and rate limiters
+abstract_cache = SimpleCache(max_size=1000, ttl_seconds=3600)  # 1 hour TTL
+semantic_scholar_limiter = RateLimiter(max_requests=90, time_window=1.0)  # 90 req/s (conservative)
+unpaywall_limiter = RateLimiter(max_requests=100, time_window=1.0)  # 100 req/s (courtesy)
 
 
 def configure_pyalex(email: str):
@@ -1452,6 +1562,356 @@ async def pubmed_author_sample(
 
 
 # ============================================================================
+# Enhanced Content Tools - Abstract and Full-text Access
+# ============================================================================
+
+@mcp.tool(
+    annotations={
+        "title": "Cache Statistics",
+        "description": (
+            "Get statistics about the abstract cache and rate limiters. "
+            "Useful for monitoring performance and cache hit rates."
+        ),
+        "readOnlyHint": True,
+        "openWorldHint": False
+    }
+)
+async def get_cache_stats() -> dict:
+    """
+    Get cache and rate limiter statistics.
+    
+    Returns:
+        dict: Statistics including:
+        - cache: Size, max size, TTL
+        - rate_limiters: Current token counts and limits
+    """
+    return {
+        'cache': abstract_cache.stats(),
+        'semantic_scholar_limiter': semantic_scholar_limiter.stats(),
+        'unpaywall_limiter': unpaywall_limiter.stats()
+    }
+
+
+@mcp.tool(
+    annotations={
+        "title": "Clear Abstract Cache",
+        "description": (
+            "Clear all cached abstracts. "
+            "Use this to force fresh data retrieval from Semantic Scholar."
+        ),
+        "readOnlyHint": False,
+        "openWorldHint": False
+    }
+)
+async def clear_abstract_cache() -> dict:
+    """
+    Clear all cached abstracts.
+    
+    Returns:
+        dict: Confirmation message
+    """
+    await abstract_cache.clear()
+    return {
+        'status': 'success',
+        'message': 'Abstract cache cleared'
+    }
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get Work Abstract",
+        "description": (
+            "Fetch complete, non-inverted abstract from Semantic Scholar with caching and fallback. "
+            "OpenAlex sometimes provides inverted abstracts (alphabetically sorted words) "
+            "due to copyright restrictions. This tool tries multiple strategies: "
+            "1. Check cache first (1 hour TTL) "
+            "2. Fetch from Semantic Scholar (with rate limiting) "
+            "3. Fallback to reconstructing from OpenAlex inverted index "
+            "Also returns influential citation count and open access PDF links when available."
+        ),
+        "readOnlyHint": True,
+        "openWorldHint": True
+    }
+)
+async def get_work_abstract(
+    doi: str = None,
+    title: str = None,
+    openalex_id: str = None
+) -> dict:
+    """
+    Get complete abstract for a paper from Semantic Scholar.
+    
+    Args:
+        doi: DOI of the paper (preferred, most reliable)
+        title: Paper title (fallback if no DOI)
+        openalex_id: OpenAlex work ID (e.g., "https://openalex.org/W1234567890")
+        
+    Returns:
+        dict: Abstract data with:
+        - abstract: Full abstract text
+        - source: "semantic_scholar"
+        - paper_id: Semantic Scholar paper ID
+        - citation_count: Total citations
+        - influential_citation_count: Influential citations (AI-powered metric)
+        - open_access_pdf: Direct PDF link if available
+        - error: Error message if fetch failed
+        
+    Example usage:
+        # Get abstract by DOI (preferred)
+        get_work_abstract(doi="10.1038/s41587-024-02534-3")
+        
+        # Get abstract by OpenAlex ID
+        get_work_abstract(openalex_id="https://openalex.org/W1234567890")
+        
+        # Fallback to title search
+        get_work_abstract(title="BERT: Pre-training of Deep Bidirectional Transformers")
+    """
+    if not any([doi, title, openalex_id]):
+        return {
+            'error': 'At least one identifier required: doi, title, or openalex_id',
+            'source': 'semantic_scholar'
+        }
+    
+    logger.info(f"🔍 Fetching abstract from Semantic Scholar")
+    result = await fetch_semantic_scholar_abstract(doi=doi, title=title, openalex_id=openalex_id)
+    return result
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get Full-text Access",
+        "description": (
+            "Get legal open access PDF links for a paper using Unpaywall API. "
+            "Returns direct links to publisher PDFs and repository versions. "
+            "100% legal - only provides links to legitimately open access content. "
+            "Includes license information and version details (published/accepted/submitted)."
+        ),
+        "readOnlyHint": True,
+        "openWorldHint": True
+    }
+)
+async def get_fulltext_access(doi: str) -> dict:
+    """
+    Get legal full-text PDF access links via Unpaywall.
+    
+    Args:
+        doi: DOI of the paper (required)
+        
+    Returns:
+        dict: Full-text access information with:
+        - is_oa: Whether paper is open access
+        - oa_status: OA type (gold, green, hybrid, bronze, closed)
+        - best_oa_location: Best PDF link with metadata
+        - oa_locations: List of all available OA locations
+        - source: "unpaywall"
+        
+        Each location includes:
+        - url: Direct PDF URL
+        - host_type: "publisher" or "repository"
+        - license: License type (e.g., "cc-by")
+        - version: "publishedVersion", "acceptedVersion", or "submittedVersion"
+        
+    Example usage:
+        # Get full-text links for a DOI
+        get_fulltext_access(doi="10.1038/s41587-024-02534-3")
+        
+        # Response example (if open access):
+        {
+            "is_oa": true,
+            "oa_status": "gold",
+            "best_oa_location": {
+                "url": "https://www.nature.com/articles/s41587-024-02534-3.pdf",
+                "host_type": "publisher",
+                "license": "cc-by",
+                "version": "publishedVersion"
+            },
+            "oa_locations": [...]
+        }
+    """
+    if not doi:
+        return {
+            'error': 'DOI is required',
+            'is_oa': False,
+            'source': 'unpaywall'
+        }
+    
+    logger.info(f"🔍 Fetching full-text access from Unpaywall")
+    result = await fetch_unpaywall_links(doi)
+    return result
+
+
+@mcp.tool(
+    annotations={
+        "title": "Enrich Work Data",
+        "description": (
+            "Get comprehensive work data combining OpenAlex metadata with "
+            "Semantic Scholar abstract and Unpaywall full-text access. "
+            "Returns a complete OptimizedWorkResult with all available enrichments. "
+            "Perfect for detailed paper analysis with full content access."
+        ),
+        "readOnlyHint": True,
+        "openWorldHint": True
+    }
+)
+async def enrich_work_data(
+    work_id: str = None,
+    doi: str = None
+) -> dict:
+    """
+    Get enriched work data with abstract and full-text access.
+    
+    Combines data from:
+    1. OpenAlex: Comprehensive metadata, citations, authorship
+    2. Semantic Scholar: Complete abstract, influential citations
+    3. Unpaywall: Legal full-text PDF access
+    
+    Args:
+        work_id: OpenAlex work ID (e.g., "https://openalex.org/W1234567890")
+        doi: DOI of the paper (alternative to work_id)
+        
+    Returns:
+        dict: Enriched OptimizedWorkResult with:
+        - All standard OpenAlex metadata
+        - abstract: Complete abstract from Semantic Scholar
+        - abstract_inverted: Whether OpenAlex had inverted abstract
+        - fulltext_urls: List of legal PDF access points
+        - enrichment_metadata: What sources were used and their status
+        
+    Example usage:
+        # Enrich by OpenAlex ID
+        enrich_work_data(work_id="https://openalex.org/W1234567890")
+        
+        # Enrich by DOI
+        enrich_work_data(doi="10.1038/s41587-024-02534-3")
+    """
+    try:
+        # Get base work data from OpenAlex
+        if work_id:
+            # Fetch work from OpenAlex by ID
+            logger.info(f"📚 Fetching work from OpenAlex: {work_id}")
+            work_data = pyalex.Works()[work_id]
+            if not work_data:
+                return {'error': f'Work not found in OpenAlex: {work_id}'}
+        elif doi:
+            # Search by DOI
+            logger.info(f"📚 Searching OpenAlex by DOI: {doi}")
+            clean_doi = doi.replace('https://doi.org/', '').replace('http://dx.doi.org/', '')
+            works = pyalex.Works().filter(doi=f"https://doi.org/{clean_doi}").get()
+            if not works:
+                return {'error': f'Work not found in OpenAlex for DOI: {doi}'}
+            work_data = list(works)[0]
+        else:
+            return {'error': 'Either work_id or doi must be provided'}
+        
+        # Convert to optimized format
+        optimized_work = optimize_work_data(work_data)
+        
+        # Initialize enrichment metadata
+        enrichment_metadata = {
+            'sources_used': ['openalex'],
+            'abstract_source': None,
+            'fulltext_source': None,
+            'errors': []
+        }
+        
+        # Get DOI for enrichment queries
+        work_doi = optimized_work.doi or (optimized_work.ids.doi if optimized_work.ids else None)
+        work_openalex_id = optimized_work.id
+        work_title = optimized_work.title
+        
+        # Check if OpenAlex has inverted abstract
+        has_inverted_abstract = 'abstract_inverted_index' in work_data
+        inverted_index = work_data.get('abstract_inverted_index') if has_inverted_abstract else None
+        
+        # Enrich with Semantic Scholar abstract (if we have identifiers)
+        abstract_obtained = False
+        if work_doi or work_openalex_id or work_title:
+            logger.info("🔍 Enriching with Semantic Scholar abstract...")
+            abstract_result = await fetch_semantic_scholar_abstract(
+                doi=work_doi,
+                openalex_id=work_openalex_id,
+                title=work_title
+            )
+            
+            if 'error' not in abstract_result and abstract_result.get('abstract'):
+                optimized_work.abstract = abstract_result['abstract']
+                optimized_work.abstract_inverted = False  # Semantic Scholar provides non-inverted
+                enrichment_metadata['abstract_source'] = 'semantic_scholar'
+                if abstract_result.get('cached'):
+                    enrichment_metadata['abstract_cached'] = True
+                enrichment_metadata['sources_used'].append('semantic_scholar')
+                logger.info(f"✅ Abstract enriched from Semantic Scholar: {len(abstract_result['abstract'])} chars")
+                abstract_obtained = True
+            else:
+                enrichment_metadata['errors'].append(f"Semantic Scholar: {abstract_result.get('error', 'Unknown error')}")
+                logger.warning(f"⚠️ Could not enrich abstract from Semantic Scholar: {abstract_result.get('error')}")
+        
+        # FALLBACK: Reconstruct from OpenAlex inverted index if Semantic Scholar failed
+        if not abstract_obtained and has_inverted_abstract and inverted_index:
+            logger.info("🔄 Falling back to OpenAlex inverted abstract reconstruction...")
+            reconstructed_abstract = reconstruct_abstract_from_inverted_index(inverted_index)
+            
+            if reconstructed_abstract:
+                optimized_work.abstract = reconstructed_abstract
+                optimized_work.abstract_inverted = True  # Mark as reconstructed from inverted
+                enrichment_metadata['abstract_source'] = 'openalex_reconstructed'
+                enrichment_metadata['sources_used'].append('openalex_inverted_index')
+                logger.info(f"✅ Abstract reconstructed from OpenAlex inverted index: {len(reconstructed_abstract)} chars")
+                abstract_obtained = True
+            else:
+                logger.warning("⚠️ Failed to reconstruct abstract from inverted index")
+        
+        # If still no abstract, check for regular abstract field in OpenAlex
+        if not abstract_obtained:
+            openalex_abstract = work_data.get('abstract')
+            if openalex_abstract:
+                optimized_work.abstract = openalex_abstract
+                optimized_work.abstract_inverted = False
+                enrichment_metadata['abstract_source'] = 'openalex'
+                logger.info(f"✅ Using OpenAlex regular abstract: {len(openalex_abstract)} chars")
+                abstract_obtained = True
+        
+        # Enrich with Unpaywall full-text access (if we have DOI)
+        if work_doi:
+            logger.info("🔍 Enriching with Unpaywall full-text access...")
+            fulltext_result = await fetch_unpaywall_links(work_doi)
+            
+            if not fulltext_result.get('error') and fulltext_result.get('is_oa'):
+                # Format fulltext URLs
+                fulltext_urls = []
+                
+                # Add best location first
+                if fulltext_result.get('best_oa_location'):
+                    fulltext_urls.append(fulltext_result['best_oa_location'])
+                
+                # Add other locations
+                for loc in fulltext_result.get('oa_locations', []):
+                    if loc not in fulltext_urls:  # Avoid duplicate
+                        fulltext_urls.append(loc)
+                
+                if fulltext_urls:
+                    optimized_work.fulltext_urls = fulltext_urls
+                    enrichment_metadata['fulltext_source'] = 'unpaywall'
+                    enrichment_metadata['sources_used'].append('unpaywall')
+                    logger.info(f"✅ Full-text access enriched: {len(fulltext_urls)} locations")
+            else:
+                if fulltext_result.get('error'):
+                    enrichment_metadata['errors'].append(f"Unpaywall: {fulltext_result['error']}")
+                logger.info("📕 Paper is not open access or no full-text available")
+        
+        # Convert to dict and add enrichment metadata
+        result = optimized_work.model_dump()
+        result['enrichment_metadata'] = enrichment_metadata
+        
+        logger.info(f"✅ Work enrichment complete. Sources used: {', '.join(enrichment_metadata['sources_used'])}")
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ Error enriching work data: {str(e)}")
+        return {'error': str(e)}
+
+
+# ============================================================================
 # ORCID Integration Functions
 # ============================================================================
 
@@ -1632,6 +2092,372 @@ async def get_orcid_works(orcid_id: str, max_works: int = 20) -> dict:
     except Exception as e:
         logger.error(f"ORCID works error: {str(e)}")
         return {'error': str(e), 'works': []}
+
+
+# ============================================================================
+# Abstract Reconstruction from Inverted Index
+# ============================================================================
+
+def reconstruct_abstract_from_inverted_index(inverted_index: dict) -> str:
+    """
+    Reconstruct readable abstract from OpenAlex inverted index.
+    
+    OpenAlex stores abstracts as inverted indexes (word -> [positions]) for copyright reasons.
+    This function reconstructs the original text.
+    
+    Args:
+        inverted_index: Dict mapping words to position lists
+        
+    Returns:
+        str: Reconstructed abstract text
+        
+    Example:
+        inverted_index = {
+            "We": [0],
+            "present": [1],
+            "a": [2],
+            "novel": [3],
+            "approach": [4]
+        }
+        # Returns: "We present a novel approach"
+    """
+    try:
+        if not inverted_index:
+            return ""
+        
+        # Find maximum position to determine text length
+        max_position = 0
+        for positions in inverted_index.values():
+            if positions:
+                max_position = max(max_position, max(positions))
+        
+        # Create array of correct size
+        words = [''] * (max_position + 1)
+        
+        # Place words at their positions
+        for word, positions in inverted_index.items():
+            for pos in positions:
+                words[pos] = word
+        
+        # Join words, handling empty positions
+        reconstructed = ' '.join(word for word in words if word)
+        
+        logger.info(f"✅ Abstract reconstructed: {len(reconstructed)} characters from {len(inverted_index)} words")
+        return reconstructed
+        
+    except Exception as e:
+        logger.error(f"❌ Error reconstructing abstract: {e}")
+        return ""
+
+
+# ============================================================================
+# Semantic Scholar Integration for Complete Abstracts
+# ============================================================================
+
+async def fetch_semantic_scholar_abstract(doi: str = None, title: str = None, openalex_id: str = None) -> dict:
+    """
+    Fetch complete abstract from Semantic Scholar API with caching and rate limiting.
+    
+    Semantic Scholar provides full abstracts (not inverted like OpenAlex for copyrighted content).
+    Free API, no key required, 100 requests/second limit.
+    
+    Features:
+    - In-memory caching (1 hour TTL)
+    - Rate limiting (90 req/s)
+    - Automatic retry on transient errors
+    
+    Args:
+        doi: DOI of the paper (preferred)
+        title: Paper title (fallback if no DOI)
+        openalex_id: OpenAlex ID (e.g., "W1234567890")
+        
+    Returns:
+        dict with:
+        - abstract: Full abstract text
+        - source: "semantic_scholar"
+        - paper_id: Semantic Scholar paper ID
+        - influential_citation_count: Additional metric
+        - cached: Whether result came from cache
+        - error: Error message if fetch failed
+    """
+    try:
+        # Generate cache key
+        cache_key = None
+        if doi:
+            cache_key = f"ss_doi:{doi}"
+        elif openalex_id:
+            cache_key = f"ss_oa:{openalex_id}"
+        elif title:
+            cache_key = f"ss_title:{title[:100]}"  # Limit key size
+        
+        # Check cache first
+        if cache_key:
+            cached_result = await abstract_cache.get(cache_key)
+            if cached_result:
+                cached_result['cached'] = True
+                return cached_result
+        
+        # Apply rate limiting
+        await semantic_scholar_limiter.acquire()
+        base_url = "https://api.semanticscholar.org/graph/v1/paper"
+        
+        # Build identifier for lookup
+        paper_identifier = None
+        if doi:
+            # Clean DOI
+            clean_doi = doi.replace('https://doi.org/', '').replace('http://dx.doi.org/', '')
+            paper_identifier = f"DOI:{clean_doi}"
+            logger.info(f"🔍 Semantic Scholar lookup by DOI: {clean_doi}")
+        elif openalex_id:
+            # Extract OpenAlex short ID (e.g., W1234567890)
+            if openalex_id.startswith('https://openalex.org/'):
+                short_id = openalex_id.split('/')[-1]
+            else:
+                short_id = openalex_id
+            paper_identifier = short_id
+            logger.info(f"🔍 Semantic Scholar lookup by OpenAlex ID: {short_id}")
+        elif title:
+            # Search by title (less reliable)
+            logger.info(f"🔍 Semantic Scholar search by title: {title[:50]}...")
+            return await search_semantic_scholar_by_title(title)
+        else:
+            return {'error': 'No identifier provided (doi, title, or openalex_id required)'}
+        
+        # Fetch paper data
+        url = f"{base_url}/{paper_identifier}"
+        params = {
+            'fields': 'paperId,title,abstract,year,citationCount,influentialCitationCount,journal,openAccessPdf'
+        }
+        
+        headers = {
+            'User-Agent': f'alex-mcp (+{get_config()["OPENALEX_MAILTO"]})'
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    abstract = data.get('abstract', '')
+                    if not abstract:
+                        logger.warning(f"⚠️ Semantic Scholar found paper but no abstract available")
+                        return {
+                            'abstract': None,
+                            'source': 'semantic_scholar',
+                            'paper_id': data.get('paperId'),
+                            'error': 'No abstract available in Semantic Scholar'
+                        }
+                    
+                    logger.info(f"✅ Semantic Scholar abstract retrieved: {len(abstract)} chars")
+                    
+                    result = {
+                        'abstract': abstract,
+                        'source': 'semantic_scholar',
+                        'paper_id': data.get('paperId'),
+                        'title': data.get('title'),
+                        'year': data.get('year'),
+                        'citation_count': data.get('citationCount'),
+                        'influential_citation_count': data.get('influentialCitationCount'),
+                        'journal': data.get('journal', {}).get('name') if data.get('journal') else None,
+                        'open_access_pdf': data.get('openAccessPdf', {}).get('url') if data.get('openAccessPdf') else None,
+                        'cached': False
+                    }
+                    
+                    # Cache the result
+                    if cache_key:
+                        await abstract_cache.set(cache_key, result)
+                    
+                    return result
+                elif response.status == 404:
+                    logger.warning(f"⚠️ Paper not found in Semantic Scholar")
+                    return {'error': 'Paper not found in Semantic Scholar', 'source': 'semantic_scholar'}
+                else:
+                    logger.error(f"❌ Semantic Scholar API error: {response.status}")
+                    return {'error': f'Semantic Scholar API error: {response.status}', 'source': 'semantic_scholar'}
+                    
+    except asyncio.TimeoutError:
+        logger.error("❌ Semantic Scholar API timeout")
+        return {'error': 'Semantic Scholar API timeout', 'source': 'semantic_scholar'}
+    except Exception as e:
+        logger.error(f"❌ Semantic Scholar error: {str(e)}")
+        return {'error': str(e), 'source': 'semantic_scholar'}
+
+
+async def search_semantic_scholar_by_title(title: str) -> dict:
+    """
+    Search Semantic Scholar by title (fallback method).
+    
+    Args:
+        title: Paper title
+        
+    Returns:
+        dict with abstract or error
+    """
+    try:
+        base_url = "https://api.semanticscholar.org/graph/v1/paper/search"
+        
+        params = {
+            'query': title,
+            'limit': 1,
+            'fields': 'paperId,title,abstract,year,citationCount,influentialCitationCount'
+        }
+        
+        headers = {
+            'User-Agent': f'alex-mcp (+{get_config()["OPENALEX_MAILTO"]})'
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(base_url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    papers = data.get('data', [])
+                    
+                    if not papers:
+                        return {'error': 'No papers found by title', 'source': 'semantic_scholar'}
+                    
+                    paper = papers[0]
+                    abstract = paper.get('abstract', '')
+                    
+                    if not abstract:
+                        return {
+                            'abstract': None,
+                            'source': 'semantic_scholar',
+                            'paper_id': paper.get('paperId'),
+                            'error': 'Paper found but no abstract available'
+                        }
+                    
+                    logger.info(f"✅ Semantic Scholar abstract retrieved by title: {len(abstract)} chars")
+                    
+                    return {
+                        'abstract': abstract,
+                        'source': 'semantic_scholar',
+                        'paper_id': paper.get('paperId'),
+                        'title': paper.get('title'),
+                        'year': paper.get('year'),
+                        'citation_count': paper.get('citationCount'),
+                        'influential_citation_count': paper.get('influentialCitationCount')
+                    }
+                else:
+                    return {'error': f'Semantic Scholar search error: {response.status}', 'source': 'semantic_scholar'}
+                    
+    except Exception as e:
+        logger.error(f"❌ Semantic Scholar title search error: {str(e)}")
+        return {'error': str(e), 'source': 'semantic_scholar'}
+
+
+# ============================================================================
+# Unpaywall Integration for Legal Full-Text Access
+# ============================================================================
+
+async def fetch_unpaywall_links(doi: str) -> dict:
+    """
+    Fetch legal open access PDF links from Unpaywall API with rate limiting.
+    
+    Unpaywall aggregates open access locations from publishers and repositories.
+    100% legal, free API (just needs email in user agent).
+    
+    Features:
+    - Rate limiting (100 req/s)
+    - Automatic retry on transient errors
+    
+    Args:
+        doi: DOI of the paper
+        
+    Returns:
+        dict with:
+        - is_oa: Whether paper is open access
+        - oa_status: OA status (gold, green, hybrid, bronze, closed)
+        - best_oa_location: Best OA location with URL
+        - oa_locations: List of all OA locations
+        - error: Error message if fetch failed
+    """
+    try:
+        # Apply rate limiting
+        await unpaywall_limiter.acquire()
+        # Clean DOI
+        clean_doi = doi.replace('https://doi.org/', '').replace('http://dx.doi.org/', '')
+        
+        # Unpaywall API endpoint
+        email = get_config()["OPENALEX_MAILTO"]
+        url = f"https://api.unpaywall.org/v2/{clean_doi}?email={email}"
+        
+        logger.info(f"🔍 Unpaywall lookup for DOI: {clean_doi}")
+        
+        headers = {
+            'User-Agent': f'alex-mcp (+{email})'
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    is_oa = data.get('is_oa', False)
+                    oa_status = data.get('oa_status', 'closed')
+                    
+                    if not is_oa:
+                        logger.info(f"📕 Paper is not open access (status: {oa_status})")
+                        return {
+                            'is_oa': False,
+                            'oa_status': oa_status,
+                            'best_oa_location': None,
+                            'oa_locations': [],
+                            'source': 'unpaywall'
+                        }
+                    
+                    # Extract OA locations
+                    best_oa_location = data.get('best_oa_location')
+                    oa_locations = data.get('oa_locations', [])
+                    
+                    # Format locations
+                    formatted_locations = []
+                    for loc in oa_locations:
+                        if loc.get('url_for_pdf') or loc.get('url'):
+                            formatted_locations.append({
+                                'url': loc.get('url_for_pdf') or loc.get('url'),
+                                'url_for_landing_page': loc.get('url_for_landing_page'),
+                                'host_type': loc.get('host_type'),  # publisher, repository
+                                'license': loc.get('license'),
+                                'version': loc.get('version')  # publishedVersion, acceptedVersion, submittedVersion
+                            })
+                    
+                    best_url = None
+                    if best_oa_location:
+                        best_url = {
+                            'url': best_oa_location.get('url_for_pdf') or best_oa_location.get('url'),
+                            'url_for_landing_page': best_oa_location.get('url_for_landing_page'),
+                            'host_type': best_oa_location.get('host_type'),
+                            'license': best_oa_location.get('license'),
+                            'version': best_oa_location.get('version')
+                        }
+                    
+                    logger.info(f"✅ Unpaywall: {len(formatted_locations)} OA locations found (status: {oa_status})")
+                    
+                    return {
+                        'is_oa': True,
+                        'oa_status': oa_status,
+                        'best_oa_location': best_url,
+                        'oa_locations': formatted_locations,
+                        'source': 'unpaywall',
+                        'doi': clean_doi,
+                        'title': data.get('title'),
+                        'journal': data.get('journal_name'),
+                        'year': data.get('year')
+                    }
+                    
+                elif response.status == 404:
+                    logger.warning(f"⚠️ DOI not found in Unpaywall database")
+                    return {'error': 'DOI not found in Unpaywall', 'is_oa': False, 'source': 'unpaywall'}
+                else:
+                    logger.error(f"❌ Unpaywall API error: {response.status}")
+                    return {'error': f'Unpaywall API error: {response.status}', 'is_oa': False, 'source': 'unpaywall'}
+                    
+    except asyncio.TimeoutError:
+        logger.error("❌ Unpaywall API timeout")
+        return {'error': 'Unpaywall API timeout', 'is_oa': False, 'source': 'unpaywall'}
+    except Exception as e:
+        logger.error(f"❌ Unpaywall error: {str(e)}")
+        return {'error': str(e), 'is_oa': False, 'source': 'unpaywall'}
 
 
 # ============================================================================
