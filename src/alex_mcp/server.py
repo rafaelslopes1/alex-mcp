@@ -7,8 +7,16 @@ using the OpenAlex API with streamlined output to minimize token usage.
 """
 
 import logging
+import hashlib
+import tempfile
+from pathlib import Path
 from typing import Optional
 from fastmcp import FastMCP
+try:
+    from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
 from alex_mcp.data_objects import (
     OptimizedAuthorResult,
     OptimizedSearchResponse,
@@ -178,7 +186,7 @@ class RateLimiter:
 abstract_cache = SimpleCache(max_size=1000, ttl_seconds=3600)  # 1 hour TTL
 semantic_scholar_limiter = RateLimiter(max_requests=90, time_window=1.0)  # 90 req/s (conservative)
 unpaywall_limiter = RateLimiter(max_requests=100, time_window=1.0)  # 100 req/s (courtesy)
-scihub_limiter = RateLimiter(max_requests=50, time_window=1.0)  # 50 req/s (very conservative)
+scihub_limiter = RateLimiter(max_requests=2, time_window=1.0)  # 2 req/s (anti-CAPTCHA)
 
 
 def configure_pyalex(email: str):
@@ -744,9 +752,9 @@ def search_works_core(
         
         # Apply sorting (NEW)
         if sort == "date":
-            works_query = works_query.sort("publication_date:desc")
+            works_query = works_query.sort(publication_date="desc")
         elif sort == "cited_by_count":
-            works_query = works_query.sort("cited_by_count:desc")
+            works_query = works_query.sort(cited_by_count="desc")
         # Default "relevance" is handled by .search() automatically
         
         # Execute query
@@ -2304,14 +2312,14 @@ async def get_cited_by(
         logger.info(f"🔗 Fetching papers citing: {normalized_id}")
         
         # Use OpenAlex filter: cites:Wxxxx returns papers that cite this work
-        works_query = pyalex.Works().filter(cites=normalized_id)
+        works_query = pyalex.Works().filter(**{"cites": normalized_id})
         
         # Apply sorting
         if sort == "cited_by_count":
-            works_query = works_query.sort("cited_by_count:desc")
+            works_query = works_query.sort(cited_by_count="desc")
         else:
             # Default: publication_date (newest first)
-            works_query = works_query.sort("publication_date:desc")
+            works_query = works_query.sort(publication_date="desc")
         
         # Fetch results
         results = works_query.get(per_page=limit)
@@ -2396,14 +2404,14 @@ async def get_references(
         
         # Use OpenAlex filter: cited_by:Wxxxx returns papers that are cited by this work
         # This is the inverse: papers found in the work's referenced_works list
-        works_query = pyalex.Works().filter(cited_by=normalized_id)
+        works_query = pyalex.Works().filter(**{"cited_by": normalized_id})
         
         # Apply sorting
         if sort == "cited_by_count":
-            works_query = works_query.sort("cited_by_count:desc")
+            works_query = works_query.sort(cited_by_count="desc")
         else:
             # Default: publication_date (newest first)
-            works_query = works_query.sort("publication_date:desc")
+            works_query = works_query.sort(publication_date="desc")
         
         # Fetch results
         results = works_query.get(per_page=limit)
@@ -2582,8 +2590,12 @@ async def get_fulltext_access(doi: str) -> dict:
     logger.info(f"🔍 Fetching full-text access from multiple sources")
     result = await fetch_unpaywall_links(doi)
     
+    # Check if alternative sources are enabled
+    scihub_enabled = get_config()["OPENALEX_ENABLE_SCIHUB"]
+    logger.info(f"🔧 Alternative sources enabled: {scihub_enabled}")
+    
     # If Unpaywall failed or found no OA, try alternative sources (if enabled)
-    if get_config()["OPENALEX_ENABLE_SCIHUB"]:
+    if scihub_enabled:
         # Try alternative sources if: error occurred, not OA, or no best location found
         should_try_alternative = (
             result.get('error') or 
@@ -2592,28 +2604,30 @@ async def get_fulltext_access(doi: str) -> dict:
             result.get('oa_status') == 'closed'
         )
         
+        logger.info(f"🔧 Should try alternative: {should_try_alternative} (error={result.get('error')}, is_oa={result.get('is_oa')}, has_location={bool(result.get('best_oa_location'))}, status={result.get('oa_status')})")
+        
         if should_try_alternative:
             logger.info(f"🔄 Trying alternative sources for full-text access")
+            # Try aiohttp first (faster)
             alt_result = await fetch_scihub_pdf(doi)
             
-            if not alt_result.get('error') and alt_result.get('pdf_url'):
-                # Alternative source successful - merge results
-                result['source'] = 'multi_source'
-                result['best_oa_location'] = {
-                    'url': alt_result['pdf_url'],
-                    'host_type': 'other',
-                    'license': 'unknown',
-                    'version': 'unknown'
-                }
-                result['is_oa'] = True
-                result['oa_status'] = result.get('oa_status', 'unknown')
-                
-                # Add to oa_locations if not already present
-                if 'oa_locations' not in result:
-                    result['oa_locations'] = []
-                result['oa_locations'].append(result['best_oa_location'])
-                
-                logger.info(f"✅ Alternative source successful")
+            # If aiohttp failed, try Playwright as fallback
+            if (alt_result.get('error') or not alt_result.get('pdf_path')) and PLAYWRIGHT_AVAILABLE:
+                logger.info(f"🔄 HTTP client failed or no file, trying Playwright fallback")
+                alt_result = await fetch_scihub_pdf_playwright(doi)
+            
+            if not alt_result.get('error') and alt_result.get('pdf_path'):
+                # Alternative source successful - do NOT claim OA, keep closed status, provide masked local path only
+                result['source'] = 'alternative_source'
+                result['is_oa'] = False
+                result['oa_status'] = result.get('oa_status', 'closed')
+                result['best_oa_location'] = None  # avoid leaking any origin URL
+                result['oa_locations'] = []
+                result['alternative_access'] = True
+                result['local_pdf_path'] = alt_result['pdf_path']
+                result['method'] = alt_result.get('method', 'unknown')
+                result['note'] = 'Non-OA alternative source fetched; internal use only.'
+                logger.info(f"✅ Alternative source successful (masked path, non-OA)")
     
     return result
 
@@ -3672,6 +3686,225 @@ async def search_semantic_scholar_by_title(title: str) -> dict:
 # Sci-Hub Integration for Internal Authorized Full-Text Access
 # ============================================================================
 
+async def fetch_scihub_pdf_playwright(doi: str) -> dict:
+    """
+    Fetch PDF from Sci-Hub using Playwright (headless browser) to bypass bot detection.
+    
+    Uses real Chromium browser to:
+    - Execute JavaScript (including some CAPTCHA challenges)
+    - Generate authentic browser fingerprint
+    - Handle cookies and session state
+    - Bypass TLS fingerprinting
+    
+    Args:
+        doi: DOI of the paper
+        
+    Returns:
+        dict with:
+        - pdf_url: Direct PDF download URL (if found)
+        - mirror_used: Which Sci-Hub mirror was successful
+        - doi: The DOI queried
+        - source: "alternative_source"
+        - error: Error message if fetch failed
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        logger.warning("⚠️ Playwright não está instalado. Use: pip install playwright && playwright install chromium")
+        return {
+            'error': 'Playwright not available',
+            'source': 'alternative_source',
+            'doi': doi
+        }
+    
+    try:
+        # Check if alternative sources are enabled
+        if not get_config()["OPENALEX_ENABLE_SCIHUB"]:
+            return {
+                'error': 'Alternative sources are disabled',
+                'source': 'alternative_source',
+                'doi': doi
+            }
+        
+        # Apply rate limiting
+        await scihub_limiter.acquire()
+        
+        # Add random delay
+        import random
+        await asyncio.sleep(random.uniform(1.5, 3.5))
+        
+        # Clean DOI
+        clean_doi = doi.replace('https://doi.org/', '').replace('http://dx.doi.org/', '')
+        
+        # Get mirrors from existing config
+        mirrors = [
+            'https://sci-hub.su',
+            'https://sci-hub.st',
+            'https://sci-hub.red',
+            'https://sci-hub.box',
+            'https://sci-hub.ru',
+        ]
+        
+        logger.info(f"🎭 Sci-Hub Playwright lookup for DOI: {clean_doi}")
+        
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-dev-shm-usage',
+                    '--no-sandbox'
+                ]
+            )
+            
+            context = await browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                viewport={'width': 1920, 'height': 1080},
+                locale='en-US',
+                timezone_id='America/New_York'
+            )
+            
+            # Remove webdriver property
+            await context.add_init_script("""Object.defineProperty(navigator, 'webdriver', {get: () => undefined})""")
+            
+            page = await context.new_page()
+            
+            # Try each mirror
+            for mirror in mirrors:
+                try:
+                    url = f"{mirror}/{clean_doi}"
+                    logger.info(f"🔍 Playwright tentando {mirror}...")
+                    
+                    response = await page.goto(url, wait_until='networkidle', timeout=30000)
+                    
+                    if response and response.status == 200:
+                        # Check if we got redirected to PDF
+                        current_url = page.url
+                        if current_url.endswith('.pdf'):
+                            logger.info(f"✅ PDF direto encontrado via {mirror}")
+                            await browser.close()
+                            return {
+                                'pdf_url': current_url,
+                                'mirror_used': mirror,
+                                'doi': clean_doi,
+                                'source': 'alternative_source',
+                                'method': 'playwright'
+                            }
+                        
+                        # Look for PDF embed/iframe PRIMEIRO (antes de verificar CAPTCHA)
+                        pdf_element = await page.query_selector('embed[type="application/pdf"]')
+                        if not pdf_element:
+                            pdf_element = await page.query_selector('object[type="application/pdf"]')
+                        if not pdf_element:
+                            pdf_element = await page.query_selector('iframe[src*=".pdf"]')
+                        if not pdf_element:
+                            pdf_element = await page.query_selector('embed[src*=".pdf"]')
+                        if not pdf_element:
+                            pdf_element = await page.query_selector('a[href*=".pdf"]')
+                        
+                        if pdf_element:
+                            pdf_url = await pdf_element.get_attribute('src') or await pdf_element.get_attribute('href') or await pdf_element.get_attribute('data')
+                            if pdf_url:
+                                # Make absolute URL
+                                if pdf_url.startswith('//'):
+                                    pdf_url = 'https:' + pdf_url
+                                elif pdf_url.startswith('/'):
+                                    pdf_url = mirror + pdf_url
+                                
+                                # Download to mask origin
+                                masked_path = None
+                                try:
+                                    async with aiohttp.ClientSession() as dl_session:
+                                        ssl_context = ssl.create_default_context(cafile=certifi.where())
+                                        async with dl_session.get(pdf_url, ssl=ssl_context, timeout=aiohttp.ClientTimeout(total=60)) as pdf_resp:
+                                            if pdf_resp.status == 200:
+                                                pdf_bytes = await pdf_resp.read()
+                                                digest = hashlib.sha256(f"{clean_doi}-{mirror}".encode()).hexdigest()[:12]
+                                                tmp_dir = Path(tempfile.gettempdir()) / "alex_mcp_pdfs"
+                                                tmp_dir.mkdir(parents=True, exist_ok=True)
+                                                pdf_path = tmp_dir / f"paper_{digest}.pdf"
+                                                pdf_path.write_bytes(pdf_bytes)
+                                                masked_path = str(pdf_path)
+                                                logger.info(f"✅ PDF encontrado via Playwright em {mirror} (masked)")
+                                except Exception as dl_err:
+                                    logger.warning(f"⚠️ Erro baixando PDF via Playwright {mirror}: {dl_err}")
+                                
+                                if masked_path:
+                                    await browser.close()
+                                    return {
+                                        'pdf_path': masked_path,
+                                        'mirror_used': mirror,
+                                        'doi': clean_doi,
+                                        'source': 'alternative_source',
+                                        'method': 'playwright'
+                                    }
+                                # If download fails, do not leak origin URL
+                                await browser.close()
+                                return {
+                                    'error': 'PDF download failed',
+                                    'doi': clean_doi,
+                                    'source': 'alternative_source',
+                                    'method': 'playwright'
+                                }
+                        
+                        # SÓ verifica CAPTCHA se NÃO encontrou PDF
+                        content = await page.content()
+                        
+                        # Check for CAPTCHA indicators mais específicos
+                        captcha_indicators = [
+                            'challenge-form',  # Cloudflare challenge
+                            'g-recaptcha',     # Google reCAPTCHA
+                            'h-captcha',       # hCaptcha
+                            'cf-challenge',    # Cloudflare
+                        ]
+                        if any(indicator in content.lower() for indicator in captcha_indicators):
+                            logger.warning(f"🤖 CAPTCHA detectado em {mirror} (Playwright)")
+                            continue
+                        
+                        if pdf_element:
+                            pdf_url = await pdf_element.get_attribute('src') or await pdf_element.get_attribute('href')
+                            if pdf_url:
+                                # Make absolute URL
+                                if pdf_url.startswith('//'):
+                                    pdf_url = 'https:' + pdf_url
+                                elif pdf_url.startswith('/'):
+                                    pdf_url = mirror + pdf_url
+                                
+                                logger.info(f"✅ PDF encontrado via Playwright em {mirror}")
+                                await browser.close()
+                                return {
+                                    'pdf_url': pdf_url,
+                                    'mirror_used': mirror,
+                                    'doi': clean_doi,
+                                    'source': 'alternative_source',
+                                    'method': 'playwright'
+                                }
+                
+                except PlaywrightTimeout:
+                    logger.warning(f"⏰ Timeout no mirror {mirror} (Playwright)")
+                    continue
+                except Exception as e:
+                    logger.warning(f"⚠️ Erro no mirror {mirror} (Playwright): {str(e)}")
+                    continue
+            
+            await browser.close()
+        
+        logger.warning(f"⚠️ Playwright: Nenhum mirror funcionou para DOI {clean_doi}")
+        return {
+            'error': 'PDF not found via Playwright',
+            'doi': clean_doi,
+            'source': 'alternative_source',
+            'method': 'playwright'
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Playwright error: {str(e)}")
+        return {
+            'error': str(e),
+            'doi': doi,
+            'source': 'alternative_source',
+            'method': 'playwright'
+        }
+
+
 async def fetch_scihub_pdf(doi: str) -> dict:
     """
     Fetch PDF from Sci-Hub with rate limiting and mirror fallback.
@@ -3704,6 +3937,10 @@ async def fetch_scihub_pdf(doi: str) -> dict:
         # Apply rate limiting
         await scihub_limiter.acquire()
         
+        # Add random delay to avoid bot detection (1-3 seconds)
+        import random
+        await asyncio.sleep(random.uniform(1.0, 3.0))
+        
         # Clean DOI
         clean_doi = doi.replace('https://doi.org/', '').replace('http://dx.doi.org/', '')
         
@@ -3718,9 +3955,19 @@ async def fetch_scihub_pdf(doi: str) -> dict:
         
         logger.info(f"🔬 Sci-Hub lookup for DOI: {clean_doi}")
         
-        email = get_config()["OPENALEX_MAILTO"]
+        # Use realistic browser headers to avoid bot detection
+        # Based on scholar_mcp_server: Windows User-Agent more common
         headers = {
-            'User-Agent': f'alex-mcp (+{email})'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none'
         }
         
         ssl_context = ssl.create_default_context(cafile=certifi.where())
@@ -3734,36 +3981,66 @@ async def fetch_scihub_pdf(doi: str) -> dict:
                     async with session.get(
                         url,
                         headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=15),
+                        timeout=aiohttp.ClientTimeout(total=30),
                         ssl=ssl_context,
                         allow_redirects=True
                     ) as response:
                         if response.status == 200:
                             # Check if we got an actual PDF or HTML page
                             content_type = response.headers.get('Content-Type', '').lower()
+
+                            # Helper to download PDF and mask the origin URL
+                            async def _download_and_mask(pdf_url: str) -> Optional[str]:
+                                try:
+                                    async with session.get(pdf_url, ssl=ssl_context, timeout=aiohttp.ClientTimeout(total=60)) as pdf_resp:
+                                        if pdf_resp.status == 200:
+                                            pdf_bytes = await pdf_resp.read()
+                                            digest = hashlib.sha256(f"{clean_doi}-{mirror}".encode()).hexdigest()[:12]
+                                            tmp_dir = Path(tempfile.gettempdir()) / "alex_mcp_pdfs"
+                                            tmp_dir.mkdir(parents=True, exist_ok=True)
+                                            pdf_path = tmp_dir / f"paper_{digest}.pdf"
+                                            pdf_path.write_bytes(pdf_bytes)
+                                            logger.info(f"✅ Sci-Hub PDF downloaded and masked at {pdf_path}")
+                                            return str(pdf_path)
+                                        logger.warning(f"⚠️ PDF download failed ({pdf_resp.status}) for {pdf_url}")
+                                except Exception as download_err:
+                                    logger.warning(f"⚠️ PDF download error for {pdf_url}: {download_err}")
+                                return None
                             
                             if 'application/pdf' in content_type:
-                                # Direct PDF link
+                                # Direct PDF link -> download and mask
                                 pdf_url = str(response.url)
-                                logger.info(f"✅ Sci-Hub PDF found via {mirror}")
+                                masked_path = await _download_and_mask(pdf_url)
+                                if masked_path:
+                                    return {
+                                        'pdf_path': masked_path,
+                                        'doi': clean_doi,
+                                        'source': 'alternative_source',
+                                        'method': 'aiohttp'
+                                    }
                                 return {
-                                    'pdf_url': pdf_url,
+                                    'error': 'PDF download failed',
                                     'doi': clean_doi,
                                     'source': 'alternative_source',
-                                    'content_type': content_type
+                                    'method': 'aiohttp'
                                 }
                             elif 'text/html' in content_type:
                                 # HTML page - parse for PDF link
                                 html_content = await response.text()
                                 
-                                # Look for PDF embed or iframe
+                                # Look for PDF embed or iframe PRIMEIRO
+                                # Based on scholar_mcp_server: multiple patterns including JS redirects and <object>
                                 import re
                                 pdf_patterns = [
+                                    r'<object[^>]+type\s*=\s*["\']application/pdf["\'][^>]+data\s*=\s*["\']([^"\']+)["\']',  # <object type="application/pdf" data="...">
+                                    r'(?i)href="([^"]*\.pdf[^"]*?)"',
+                                    r'(?i)src="([^"]*\.pdf[^"]*?)"',
+                                    r'(?i)location\.href\s*=\s*["\']([^"\']*\.pdf[^"\']*?)["\']',
                                     r'<iframe[^>]+src="([^"]+\.pdf[^"]*?)"',
                                     r'<embed[^>]+src="([^"]+\.pdf[^"]*?)"',
-                                    r'href="([^"]+\.pdf[^"]*?)"',
                                 ]
                                 
+                                pdf_found = False
                                 for pattern in pdf_patterns:
                                     matches = re.findall(pattern, html_content, re.IGNORECASE)
                                     if matches:
@@ -3775,6 +4052,36 @@ async def fetch_scihub_pdf(doi: str) -> dict:
                                             pdf_url = mirror + pdf_url
                                         
                                         logger.info(f"✅ Sci-Hub PDF link found via {mirror}")
+                                        masked_path = await _download_and_mask(pdf_url)
+                                        if masked_path:
+                                            pdf_found = True
+                                            return {
+                                                'pdf_path': masked_path,
+                                                'doi': clean_doi,
+                                                'source': 'alternative_source',
+                                                'method': 'aiohttp'
+                                            }
+                                        pdf_found = True
+                                        return {
+                                            'error': 'PDF download failed',
+                                            'doi': clean_doi,
+                                            'source': 'alternative_source',
+                                            'method': 'aiohttp'
+                                        }
+                                
+                                # SÓ verifica CAPTCHA se não encontrou PDF
+                                if not pdf_found:
+                                    captcha_indicators = [
+                                        'challenge-form',  # Cloudflare challenge
+                                        'g-recaptcha',     # Google reCAPTCHA
+                                        'h-captcha',       # hCaptcha
+                                        'cf-challenge',    # Cloudflare
+                                    ]
+                                    
+                                    html_lower = html_content.lower()
+                                    if any(indicator in html_lower for indicator in captcha_indicators):
+                                        logger.warning(f"🤖 Sci-Hub CAPTCHA detected on {mirror}, trying next mirror")
+                                        continue
                                         return {
                                             'pdf_url': pdf_url,
                                             'doi': clean_doi,
