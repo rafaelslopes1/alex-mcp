@@ -184,7 +184,7 @@ class RateLimiter:
 
 # Initialize cache and rate limiters
 abstract_cache = SimpleCache(max_size=1000, ttl_seconds=3600)  # 1 hour TTL
-semantic_scholar_limiter = RateLimiter(max_requests=90, time_window=1.0)  # 90 req/s (conservative)
+semantic_scholar_limiter = RateLimiter(max_requests=1, time_window=1.0)  # 1 req/s (no API key public limit)
 unpaywall_limiter = RateLimiter(max_requests=100, time_window=1.0)  # 100 req/s (courtesy)
 scihub_limiter = RateLimiter(max_requests=2, time_window=1.0)  # 2 req/s (anti-CAPTCHA)
 
@@ -1994,7 +1994,9 @@ async def clear_abstract_cache() -> dict:
 async def get_work_abstract(
     doi: str = None,
     title: str = None,
-    openalex_id: str = None
+    openalex_id: str = None,
+    work_id: str = None,
+    id: str = None,
 ) -> dict:
     """
     Get complete abstract for a paper from Semantic Scholar.
@@ -2024,6 +2026,7 @@ async def get_work_abstract(
         # Fallback to title search
         get_work_abstract(title="BERT: Pre-training of Deep Bidirectional Transformers")
     """
+    openalex_id = openalex_id or work_id or id
     if not any([doi, title, openalex_id]):
         return {
             'error': 'At least one identifier required: doi, title, or openalex_id',
@@ -3612,46 +3615,52 @@ async def fetch_semantic_scholar_abstract(doi: str = None, title: str = None, op
         ssl_context = ssl.create_default_context(cafile=certifi.where())
         
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, headers=headers, ssl=ssl_context, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    
-                    abstract = data.get('abstract', '')
-                    if not abstract:
-                        logger.warning(f"⚠️ Semantic Scholar found paper but no abstract available")
-                        return {
-                            'abstract': None,
+            for attempt in range(3):
+                async with session.get(url, params=params, headers=headers, ssl=ssl_context, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+
+                        abstract = data.get('abstract', '')
+                        if not abstract:
+                            logger.warning(f"⚠️ Semantic Scholar found paper but no abstract available")
+                            return {
+                                'abstract': None,
+                                'source': 'semantic_scholar',
+                                'paper_id': data.get('paperId'),
+                                'error': 'No abstract available in Semantic Scholar'
+                            }
+
+                        logger.info(f"✅ Semantic Scholar abstract retrieved: {len(abstract)} chars")
+
+                        result = {
+                            'abstract': abstract,
                             'source': 'semantic_scholar',
                             'paper_id': data.get('paperId'),
-                            'error': 'No abstract available in Semantic Scholar'
+                            'title': data.get('title'),
+                            'year': data.get('year'),
+                            'citation_count': data.get('citationCount'),
+                            'influential_citation_count': data.get('influentialCitationCount'),
+                            'journal': data.get('journal', {}).get('name') if data.get('journal') else None,
+                            'open_access_pdf': data.get('openAccessPdf', {}).get('url') if data.get('openAccessPdf') else None,
+                            'cached': False
                         }
-                    
-                    logger.info(f"✅ Semantic Scholar abstract retrieved: {len(abstract)} chars")
-                    
-                    result = {
-                        'abstract': abstract,
-                        'source': 'semantic_scholar',
-                        'paper_id': data.get('paperId'),
-                        'title': data.get('title'),
-                        'year': data.get('year'),
-                        'citation_count': data.get('citationCount'),
-                        'influential_citation_count': data.get('influentialCitationCount'),
-                        'journal': data.get('journal', {}).get('name') if data.get('journal') else None,
-                        'open_access_pdf': data.get('openAccessPdf', {}).get('url') if data.get('openAccessPdf') else None,
-                        'cached': False
-                    }
-                    
-                    # Cache the result
-                    if cache_key:
-                        await abstract_cache.set(cache_key, result)
-                    
-                    return result
-                elif response.status == 404:
-                    logger.warning(f"⚠️ Paper not found in Semantic Scholar")
-                    return {'error': 'Paper not found in Semantic Scholar', 'source': 'semantic_scholar'}
-                else:
-                    logger.error(f"❌ Semantic Scholar API error: {response.status}")
-                    return {'error': f'Semantic Scholar API error: {response.status}', 'source': 'semantic_scholar'}
+
+                        if cache_key:
+                            await abstract_cache.set(cache_key, result)
+
+                        return result
+                    elif response.status == 429:
+                        wait = 2 ** attempt
+                        logger.warning(f"⏳ Semantic Scholar 429 rate limit, retry {attempt+1}/3 in {wait}s")
+                        await asyncio.sleep(wait)
+                        continue
+                    elif response.status == 404:
+                        logger.warning(f"⚠️ Paper not found in Semantic Scholar")
+                        return {'error': 'Paper not found in Semantic Scholar', 'source': 'semantic_scholar'}
+                    else:
+                        logger.error(f"❌ Semantic Scholar API error: {response.status}")
+                        return {'error': f'Semantic Scholar API error: {response.status}', 'source': 'semantic_scholar'}
+            return {'error': 'Semantic Scholar API error: 429 after 3 retries', 'source': 'semantic_scholar'}
                     
     except asyncio.TimeoutError:
         logger.error("❌ Semantic Scholar API timeout")
