@@ -1882,7 +1882,9 @@ async def search_pubmed(
     }
 )
 async def pubmed_author_sample(
-    author_name: str,
+    author_name: Optional[str] = None,
+    name: Optional[str] = None,
+    query: Optional[str] = None,
     sample_size: int = 5
 ) -> dict:
     """
@@ -1904,12 +1906,16 @@ async def pubmed_author_sample(
         # Get institutional profile for author
         pubmed_author_sample("Ivan Matic", sample_size=5)
     """
+    resolved_author_name = author_name or name or query
+    if not resolved_author_name:
+        return {"error": "Either author_name, name, or query is required"}
+
     # Validate parameters
     sample_size = min(max(sample_size, 1), 10)  # Cap at 10 for performance
+
+    logger.info(f"🔍 PubMed author sample: '{resolved_author_name}' (sample: {sample_size})")
     
-    logger.info(f"🔍 PubMed author sample: '{author_name}' (sample: {sample_size})")
-    
-    result = get_pubmed_author_sample(author_name, sample_size)
+    result = get_pubmed_author_sample(resolved_author_name, sample_size)
     return result
 
 
@@ -2072,7 +2078,9 @@ def normalize_work_id(work_id: str) -> str:
     }
 )
 async def get_work(
-    work_id: str,
+    work_id: Optional[str] = None,
+    id: Optional[str] = None,
+    openalex_id: Optional[str] = None,
     include_authorships: bool = False,
     include_locations: bool = False,
     include_best_oa_location: bool = True,
@@ -2111,10 +2119,14 @@ async def get_work(
             author_id = authorship['author']['id']  # OpenAlex ID, not name
             author_name = authorship['author']['display_name']
     """
+    work_id = work_id or id or openalex_id
+    if not work_id:
+        return {"error": "Either work_id, id, or openalex_id is required"}
+
     try:
         # Normalize work_id
         normalized_id = normalize_work_id(work_id)
-        
+
         logger.info(f"📄 Fetching complete work: {normalized_id}")
         
         # Fetch from OpenAlex
@@ -2303,7 +2315,9 @@ async def get_work_by_doi(
     }
 )
 async def get_cited_by(
-    work_id: str,
+    work_id: Optional[str] = None,
+    id: Optional[str] = None,
+    openalex_id: Optional[str] = None,
     limit: int = 50,
     sort: str = "publication_date"
 ) -> dict:
@@ -2324,11 +2338,15 @@ async def get_cited_by(
     Example:
         citations = await get_cited_by("W2741809807", limit=20, sort="publication_date")
     """
+    work_id = work_id or id or openalex_id
+    if not work_id:
+        return {"error": "Either work_id, id, or openalex_id is required"}
+
     try:
         # Normalize work_id
         normalized_id = normalize_work_id(work_id)
         limit = min(limit, 100)
-        
+
         logger.info(f"🔗 Fetching papers citing: {normalized_id}")
         
         # Use OpenAlex filter: cites:Wxxxx returns papers that cite this work
@@ -2394,7 +2412,9 @@ async def get_cited_by(
     }
 )
 async def get_references(
-    work_id: str,
+    work_id: Optional[str] = None,
+    id: Optional[str] = None,
+    openalex_id: Optional[str] = None,
     limit: int = 50,
     sort: str = "publication_date"
 ) -> dict:
@@ -2415,11 +2435,15 @@ async def get_references(
     Example:
         refs = await get_references("W2741809807", limit=25)
     """
+    work_id = work_id or id or openalex_id
+    if not work_id:
+        return {"error": "Either work_id, id, or openalex_id is required"}
+
     try:
         # Normalize work_id
         normalized_id = normalize_work_id(work_id)
         limit = min(limit, 100)
-        
+
         logger.info(f"📚 Fetching papers referenced by: {normalized_id}")
         
         # Use OpenAlex filter: cited_by:Wxxxx returns papers that are cited by this work
@@ -4270,7 +4294,9 @@ async def fetch_unpaywall_links(doi: str) -> dict:
     }
 )
 async def search_orcid_authors(
-    name: str,
+    name: Optional[str] = None,
+    query: Optional[str] = None,
+    author_name: Optional[str] = None,
     affiliation: str = None,
     max_results: int = 10
 ) -> dict:
@@ -4295,10 +4321,14 @@ async def search_orcid_authors(
         # Search with affiliation for better disambiguation
         search_orcid_authors("Maria Garcia", "University of Barcelona")
     """
+    resolved_name = name or query or author_name
+    if not resolved_name:
+        return {"error": "Either name, query, or author_name is required"}
+
     # Validate parameters
     max_results = min(max(max_results, 1), 50)  # ORCID API limit
-    
-    result = await search_orcid_by_name(name, affiliation, max_results)
+
+    result = await search_orcid_by_name(resolved_name, affiliation, max_results)
     return result
 
 
