@@ -18,3 +18,11 @@ pyalex==0.18
 # PubMed API integration
 biopython>=1.83
 requests>=2.31.0
+
+# Optional: Playwright for headless browser (bypass CAPTCHA)
+# Install with: pip install playwright && playwright install chromium
+playwright>=1.40.0
+
+# Optional: Playwright for headless browser (bypass CAPTCHA)
+# Install with: pip install playwright && playwright install chromium
+playwright>=1.40.0

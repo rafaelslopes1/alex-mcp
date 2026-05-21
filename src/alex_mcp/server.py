@@ -846,6 +846,7 @@ def retrieve_author_works_core(
     limit: int = 20_000,  # High default limit for comprehensive analysis
     order_by: str = "date",  # "date" or "citations"
     publication_year: Optional[int] = None,
+    year_from: Optional[int] = None,
     type: Optional[str] = None,
     journal_only: bool = True,  # Default to True for peer-reviewed content
     min_citations: Optional[int] = None,
@@ -892,6 +893,8 @@ def retrieve_author_works_core(
         # Add optional filters
         if publication_year:
             filters["publication_year"] = publication_year
+        if year_from:
+            filters["publication_year"] = f">={year_from}"
         if type:
             filters["type"] = type
         elif journal_only:
@@ -1017,7 +1020,8 @@ def retrieve_author_works_core(
     }
 )
 async def search_authors(
-    name: str,
+    name: Optional[str] = None,
+    query: Optional[str] = None,
     institution: Optional[str] = None,
     topic: Optional[str] = None,
     country_code: Optional[str] = None,
@@ -1028,6 +1032,7 @@ async def search_authors(
 
     Args:
         name: Author name to search for.
+        query: Alias for name.
         institution: (Optional) Institution name filter.
         topic: (Optional) Topic filter.
         country_code: (Optional) Country code filter.
@@ -1036,11 +1041,15 @@ async def search_authors(
     Returns:
         dict: Serialized OptimizedSearchResponse with streamlined author data.
     """
+    resolved_name = name or query
+    if not resolved_name:
+        return {"error": "Either name or query is required", "results": [], "total_count": 0}
+
     # Ensure reasonable limits to control token usage
     limit = min(limit, 100)  # Increased for comprehensive author search
-    
+
     response = search_authors_core(
-        name=name,
+        name=resolved_name,
         institution=institution,
         topic=topic,
         country_code=country_code,
@@ -1063,10 +1072,13 @@ async def search_authors(
     }
 )
 async def retrieve_author_works(
-    author_id: str,
+    author_id: Optional[str] = None,
+    author_name: Optional[str] = None,
     limit: Optional[int] = None,
+    max_works: Optional[int] = None,
     order_by: str = "date",
     publication_year: Optional[int] = None,
+    year_from: Optional[int] = None,
     type: Optional[str] = None,
     journal_only: bool = True,
     min_citations: Optional[int] = None,
@@ -1091,9 +1103,12 @@ async def retrieve_author_works(
 
     Args:
         author_id: OpenAlex Author ID (e.g., 'https://openalex.org/A123456789')
+        author_name: Author display name — resolved to author_id automatically via search
         limit: Maximum number of results (default: None = ALL works via pagination, max: 2000)
+        max_works: Alias for limit
         order_by: Sort order - "date" for newest first, "citations" for most cited first
-        publication_year: Filter by specific publication year
+        publication_year: Filter by exact publication year
+        year_from: Filter works published from this year onwards (>=)
         type: Filter by work type (e.g., "journal-article", "letter")
         journal_only: If True, only return journal articles and letters (default: True)
         min_citations: Only return works with at least this many citations
@@ -1101,31 +1116,36 @@ async def retrieve_author_works(
 
     Returns:
         dict: Serialized OptimizedWorksSearchResponse with author's works.
-        
-    Usage Patterns:
-        # For AI validation (sample of high-impact works)
-        retrieve_author_works(author_id, limit=20, order_by="citations")
-        
-        # For complete benchmark evaluation (ALL works, minimal filtering)
-        retrieve_author_works(author_id, peer_reviewed_only=False, journal_only=False)
-        
-        # For peer-reviewed works only (default behavior)
-        retrieve_author_works(author_id)
     """
+    # Resolve author_name → author_id if needed
+    if author_id is None and author_name is not None:
+        search_result = search_authors_core(name=author_name, limit=1)
+        if not search_result.results:
+            return {"error": f"No author found for name: {author_name}", "works": [], "total_count": 0}
+        author_id = search_result.results[0].id
+        logger.info(f"Resolved author_name '{author_name}' to author_id '{author_id}'")
+    elif author_id is None:
+        return {"error": "Either author_id or author_name is required", "works": [], "total_count": 0}
+
+    # max_works is an alias for limit
+    if max_works is not None and limit is None:
+        limit = max_works
+
     # Handle limit: None means ALL works, otherwise cap at reasonable limit
     logger.info(f"MCP tool received limit parameter: {limit}")
     if limit is None:
-        limit = 2000  # Set a very high limit to get ALL works
+        limit = 2000
         logger.info(f"No limit specified, setting to {limit} for comprehensive retrieval")
     else:
-        limit = min(limit, 2000)  # Increased max limit for comprehensive analysis
+        limit = min(limit, 2000)
         logger.info(f"Explicit limit specified, capped to {limit}")
-    
+
     response = retrieve_author_works_core(
         author_id=author_id,
         limit=limit,
         order_by=order_by,
         publication_year=publication_year,
+        year_from=year_from,
         type=type,
         journal_only=journal_only,
         min_citations=min_citations,
